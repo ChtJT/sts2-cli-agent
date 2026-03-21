@@ -192,23 +192,23 @@ def show_combat(state):
                     else:
                         intent_parts.append(c(f"⚔{dmg}", "red"))
                 else:
-                    intent_parts.append(c("⚔ATK", "red"))
+                    intent_parts.append(c(t("⚔ATK","⚔攻击"), "red"))
             elif itype == "Defend":
-                intent_parts.append(c("🛡DEF", "blue"))
+                intent_parts.append(c(t("🛡DEF","🛡防御"), "blue"))
             elif itype in ("Buff", "Heal"):
-                intent_parts.append(c(f"⬆{itype}", "magenta"))
+                intent_parts.append(c(t(f"⬆{itype}",f"⬆{'增益' if itype=='Buff' else '回复'}"), "magenta"))
             elif itype in ("Debuff", "DebuffStrong", "CardDebuff", "StatusCard"):
-                intent_parts.append(c(f"⬇{itype}", "yellow"))
+                intent_parts.append(c(t(f"⬇{itype}","⬇减益"), "yellow"))
             elif itype == "DeathBlow":
-                intent_parts.append(c("💀KILL", "red"))
+                intent_parts.append(c(t("💀KILL","💀必杀"), "red"))
             elif itype == "Escape":
-                intent_parts.append(c("🏃Escape", "dim"))
+                intent_parts.append(c(t("🏃Escape","🏃逃跑"), "dim"))
             elif itype == "Summon":
-                intent_parts.append(c("📢Summon", "magenta"))
+                intent_parts.append(c(t("📢Summon","📢召唤"), "magenta"))
             elif itype == "Sleep":
-                intent_parts.append(c("💤Sleep", "dim"))
+                intent_parts.append(c(t("💤Sleep","💤休眠"), "dim"))
             elif itype == "Stun":
-                intent_parts.append(c("⚡Stun", "yellow"))
+                intent_parts.append(c(t("⚡Stun","⚡眩晕"), "yellow"))
             elif itype == "Hidden":
                 intent_parts.append(c("? ???", "dim"))
             elif itype:
