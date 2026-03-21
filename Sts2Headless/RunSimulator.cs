@@ -1898,6 +1898,21 @@ public class RunSimulator
                 catch (Exception ex4) { Console.Error.WriteLine($"[WARN] Failed to patch GetLocString: {ex4.Message}"); }
             }
 
+            // Patch FromChooseABundleScreen to use our card selector
+            try
+            {
+                var bundleMethod = typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd).GetMethod("FromChooseABundleScreen",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                var bundlePrefix = typeof(LocPatches).GetMethod(nameof(LocPatches.BundleScreenPrefix),
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                if (bundleMethod != null && bundlePrefix != null)
+                {
+                    harmony.Patch(bundleMethod, new HarmonyMethod(bundlePrefix));
+                    Console.Error.WriteLine("[INFO] Patched FromChooseABundleScreen");
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[WARN] Bundle patch: {ex.Message}"); }
+
             // Patch HasEntry to always return true
             PatchMethod(harmony, typeof(LocTable), "HasEntry", nameof(LocPatches.HasEntryPrefix));
 
@@ -1975,6 +1990,44 @@ public class RunSimulator
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
             var tableName = nameField?.GetValue(__instance) as string ?? "_unknown";
             __result = new LocString(tableName, key);
+            return false;
+        }
+
+        /// <summary>
+        /// Intercept bundle selection screen — flatten bundles into one card list
+        /// and use the CardSelectCmd.Selector (HeadlessCardSelector) to pick.
+        /// </summary>
+        public static bool BundleScreenPrefix(
+            MegaCrit.Sts2.Core.Entities.Players.Player player,
+            IReadOnlyList<IReadOnlyList<CardModel>> bundles,
+            ref Task<IEnumerable<CardModel>> __result)
+        {
+            var selector = MegaCrit.Sts2.Core.Commands.CardSelectCmd.Selector;
+            if (selector != null && bundles.Count > 0)
+            {
+                // Present all cards from all bundles, grouped
+                // The selector picks cards from the combined list
+                // Then we return the bundle that contains those cards
+                var allCards = new List<CardModel>();
+                foreach (var bundle in bundles)
+                    allCards.AddRange(bundle);
+
+                __result = selector.GetSelectedCards(allCards, 1, allCards.Count)
+                    .ContinueWith(t =>
+                    {
+                        var selected = t.Result?.ToList() ?? new List<CardModel>();
+                        // Find which bundle the first selected card belongs to
+                        foreach (var bundle in bundles)
+                        {
+                            if (selected.Any(s => bundle.Contains(s)))
+                                return (IEnumerable<CardModel>)bundle;
+                        }
+                        return (IEnumerable<CardModel>)(bundles.Count > 0 ? bundles[0] : Array.Empty<CardModel>());
+                    });
+                return false; // skip original
+            }
+            // No selector — auto-pick first bundle
+            __result = Task.FromResult<IEnumerable<CardModel>>(bundles.Count > 0 ? bundles[0] : Array.Empty<CardModel>());
             return false;
         }
 
