@@ -166,6 +166,7 @@ public class RunSimulator
     private List<Reward>? _pendingRewards;
     private CardReward? _pendingCardReward;
     private bool _rewardsProcessed;
+    private int _goldBeforeCombat;
     private readonly HeadlessCardSelector _cardSelector = new();
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
@@ -1201,6 +1202,7 @@ public class RunSimulator
         // Generate rewards manually instead of using TestMode auto-accept
         if (_pendingRewards == null && !_rewardsProcessed)
         {
+            _goldBeforeCombat = player.Gold;
             try
             {
                 var rewardsSet = new RewardsSet(player).WithRewardsFromRoom(combatRoom);
@@ -1289,6 +1291,7 @@ public class RunSimulator
             ["context"] = RunContext(),
             ["cards"] = cards,
             ["can_skip"] = _pendingCardReward.CanSkip,
+            ["gold_earned"] = _runState!.Players[0].Gold - _goldBeforeCombat,
             ["player"] = PlayerSummary(_runState!.Players[0]),
         };
     }
@@ -1570,11 +1573,18 @@ public class RunSimulator
                     ["vars"] = vars.Count > 0 ? vars : null,
                 };
             }).ToList(),
-            ["potions"] = player.Potions?.Select((p, i) => p == null ? null : new Dictionary<string, object?>
+            ["potions"] = player.Potions?.Select((p, i) =>
             {
-                ["index"] = i,
-                ["name"] = _loc.Potion(p.Id.Entry),
-                ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
+                if (p == null) return null;
+                var pvars = new Dictionary<string, object?>();
+                try { foreach (var dv in p.DynamicVars.Values) pvars[dv.Name] = (int)dv.BaseValue; } catch { }
+                return new Dictionary<string, object?>
+                {
+                    ["index"] = i,
+                    ["name"] = _loc.Potion(p.Id.Entry),
+                    ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
+                    ["vars"] = pvars.Count > 0 ? pvars : null,
+                };
             }).Where(x => x != null).ToList(),
             ["deck_size"] = player.Deck?.Cards?.Count ?? 0,
             ["deck"] = player.Deck?.Cards?.Select(c => new Dictionary<string, object?>
