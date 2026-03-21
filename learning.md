@@ -115,3 +115,19 @@
 - Also: HP=8 entering Elite is suicide — need hard block on Elite at <50% HP
 - Bygone Effigy: starts sleeping (SleepIntent), wakes up (BuffIntent), then attacks
   Has SlowPower. Normal combat mechanics, not invulnerable.
+
+## Game df_212 Analysis (Floor 9 defeat — got Bludgeon+Inflame+Whirlwind!)
+- PERFECT CARDS: Bludgeon(32dmg), Inflame(+2STR), Whirlwind(AOE), Fiend Fire
+- Booming Conch relic (extra draw at Elite start)
+- JungleMaze event gave +145 gold bonus!
+- Died to Byrdonis Elite 93hp at HP=26 — entered too weak
+- Problem: Vine Shambler 61hp fight drained HP 53→26, then forced into Elite
+- Gold 310 UNSPENT — need to buy from shop
+- Strike was upgraded! (Smith at rest site)
+- This deck would crush the boss with >50 HP entering
+
+## Key Insight for Winning
+- Card quality is NOT the bottleneck — the strategy gets good cards
+- HP management IS the bottleneck — need to enter boss at >50 HP
+- Need: more rest sites, avoid unnecessary fights, buy healing potions
+- The CLI correctly handles all game mechanics — this is purely a strategy problem
