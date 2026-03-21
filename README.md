@@ -1,63 +1,63 @@
 # sts2-cli
 
-在终端里玩杀戮尖塔2。
+Play Slay the Spire 2 in your terminal.
 
-通过反编译游戏 DLL + stub Godot 运行时，实现了无 GPU、无 UI 的完整游戏模拟。所有伤害计算、卡牌效果、敌人AI、遗物触发、随机数都和真实游戏一致。
+Runs the real game engine (sts2.dll) headless — no GPU, no UI, no Godot. All damage, card effects, enemy AI, relics, and RNG are identical to the actual game.
+
+[中文文档](README_zh.md)
 
 ![demo](docs/demo.gif)
 
-## 安装
+## Setup
 
-需要：
-- [Slay the Spire 2](https://store.steampowered.com/app/2868840/Slay_the_Spire_2/) (Steam)
+Requirements:
+- [Slay the Spire 2](https://store.steampowered.com/app/2868840/Slay_the_Spire_2/) on Steam
 - [.NET 9+ SDK](https://dotnet.microsoft.com/download)
 - Python 3.9+
 
 ```bash
 git clone https://github.com/wuhao21/sts2-cli.git
 cd sts2-cli
-./setup.sh      # 从 Steam 复制 DLL → IL patch → 编译
+./setup.sh      # copies DLLs from Steam → IL patches → builds
 ```
 
-或者直接运行 `python3 python/play.py`，首次会自动完成 setup。
+Or just run `python3 python/play.py` — it auto-detects and sets up on first run.
 
-## 玩
+## Play
 
 ```bash
-python3 python/play.py              # 中文交互模式
-python3 python/play.py --lang en    # English
-python3 python/play.py --auto       # AI 自动打
-python3 python/smart_agent.py 100   # 跑 100 局
+python3 python/play.py                # interactive (Chinese)
+python3 python/play.py --lang en      # interactive (English)
+python3 python/play.py --auto         # auto-play
+python3 python/smart_agent.py 100     # run 100 games
 ```
 
-游戏内输入 `help` 查看所有命令：
+Type `help` in-game:
 
 ```
-  help     — 帮助
-  map      — 显示地图
-  deck     — 查看牌组
-  potions  — 查看药水
-  relics   — 查看遗物
-  quit     — 退出
+  help     — show help
+  map      — show map
+  deck     — show deck
+  potions  — show potions
+  relics   — show relics
+  quit     — quit
 
-  地图:    输入编号 (0, 1, 2)
-  战斗:    输入卡牌编号 / e 结束回合 / p0 使用药水
-  奖励:    输入卡牌编号 / s 跳过
-  休息:    输入选项编号
-  事件:    输入选项编号 / leave 离开
-  商店:    c0 买卡 / r0 买遗物 / p0 买药水 / rm 移除 / leave 离开
+  Map:     enter path number (0, 1, 2)
+  Combat:  card index / e (end turn) / p0 (use potion)
+  Reward:  card index / s (skip)
+  Rest:    option index
+  Event:   option index / leave
+  Shop:    c0 (card) / r0 (relic) / p0 (potion) / rm (remove) / leave
 ```
 
-## JSON 协议
+## JSON Protocol
 
-除了交互模式，也可以通过 stdin/stdout JSON 协议编程控制（写 AI agent、RL 训练等）：
+For programmatic control (AI agents, RL, etc.), communicate via stdin/stdout JSON:
 
 ```bash
-# 启动 headless 进程
 dotnet run --project Sts2Headless/Sts2Headless.csproj
 ```
 
-发送命令：
 ```json
 {"cmd": "start_run", "character": "Ironclad", "seed": "test", "ascension": 0}
 {"cmd": "action", "action": "play_card", "args": {"card_index": 0, "target_index": 0}}
@@ -67,18 +67,18 @@ dotnet run --project Sts2Headless/Sts2Headless.csproj
 {"cmd": "quit"}
 ```
 
-每个命令返回一个 JSON decision point（`map_select` / `combat_play` / `card_reward` / `rest_site` / `event_choice` / `shop` / `game_over`），所有名称都是中英双语。
+Each command returns a JSON decision point (`map_select` / `combat_play` / `card_reward` / `rest_site` / `event_choice` / `shop` / `game_over`). All names are bilingual (en/zh).
 
-## 架构
+## Architecture
 
 ```
-你的代码 (Python / JS / LLM)
+Your code (Python / JS / LLM)
     │  JSON stdin/stdout
     ▼
 Sts2Headless (C#)
     │  RunSimulator.cs
     ▼
-sts2.dll (游戏引擎, IL patched)
-  + GodotStubs (替代 GodotSharp.dll)
-  + Harmony patches (本地化)
+sts2.dll (game engine, IL patched)
+  + GodotStubs (replaces GodotSharp.dll)
+  + Harmony patches (localization)
 ```

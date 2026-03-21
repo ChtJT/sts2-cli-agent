@@ -43,11 +43,10 @@ def pause(s=DELAY):
     time.sleep(s)
 
 try:
-    print("\033[2J\033[H", end="")  # Clear screen
     print(P.c("═" * 60, "bold"))
     print(P.c("  Slay the Spire 2 — Headless CLI Demo", "bold"))
     print(P.c("═" * 60, "bold"))
-    pause(1.5)
+    pause(1.0)
 
     ready = read()
     state = send({"cmd": "start_run", "character": "Ironclad", "seed": "demo_2024"})
