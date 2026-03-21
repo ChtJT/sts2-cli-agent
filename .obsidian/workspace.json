@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "f5193791bcb15843",
+        "id": "8eafdf21c1dcf9fc",
         "type": "tabs",
         "children": [
           {
-            "id": "9607fca0d5fe0557",
+            "id": "716ea32a674eff32",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "README.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "README"
+              "title": "New tab"
             }
           }
         ]
@@ -94,7 +90,6 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "README.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +99,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for README"
+              "title": "Backlinks"
             }
           },
           {
@@ -113,12 +108,11 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "README.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from README"
+              "title": "Outgoing links"
             }
           },
           {
@@ -156,13 +150,12 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "README.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of README"
+              "title": "Outline"
             }
           }
         ]
@@ -183,8 +176,9 @@
       "bases:Create new base": false
     }
   },
-  "active": "9607fca0d5fe0557",
+  "active": "716ea32a674eff32",
   "lastOpenFiles": [
+    "README.md",
     "python/smart_agent.py",
     "learning.md",
     "python/play.py",
@@ -195,7 +189,6 @@
     "localization_eng/settings_ui.json",
     "localization_eng/run_history.json",
     "localization_eng/rich_presence.json",
-    "localization_eng/rest_site_ui.json",
-    "localization_eng/relics.json"
+    "localization_eng/rest_site_ui.json"
   ]
 }

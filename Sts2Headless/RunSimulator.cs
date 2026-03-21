@@ -192,11 +192,8 @@ public class RunSimulator
             RunManager.Instance.SetUpTest(_runState, netService);
             LocalContext.NetId = netService.NetId;
 
-            // Neow event gives 3 blessing options at the start.
-            // But our loc patches cause Neow's GenerateInitialOptions to fail silently.
-            // Disable Neow for now — the blessings are relics and would need
-            // proper loc data to display option descriptions.
-            _runState.ExtraFields.StartedWithNeow = false;
+            // Force Neow event (blessing selection at start)
+            _runState.ExtraFields.StartedWithNeow = true;
 
             // Generate rooms for all acts
             RunManager.Instance.GenerateRooms();
@@ -1139,6 +1136,7 @@ public class RunSimulator
         _syncCtx.Pump();
 
         // If event is finished, proceed to map
+        if (localEvent == null || localEvent.IsFinished)
         {
             Log($"Event {localEvent?.GetType().Name ?? "null"} finished, proceeding");
             try
@@ -1550,24 +1548,47 @@ public class RunSimulator
             var instance = System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(LocManager));
             instanceProp!.SetValue(null, instance);
 
-            // Set _tables with all known table names
+            // Load REAL localization data from localization_eng/ JSON files
             var tablesField = typeof(LocManager).GetField("_tables",
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
             var tables = new Dictionary<string, LocTable>();
-            var tableNames = new[] {
-                "achievements", "acts", "afflictions", "ancients", "ascension",
-                "bestiary", "card_keywords", "card_library", "card_reward_ui",
-                "card_selection", "cards", "characters", "combat_messages",
-                "credits", "enchantments", "encounters", "epochs", "eras",
-                "events", "ftues", "game_over_screen", "gameplay_ui",
-                "inspect_relic_screen", "intents", "main_menu_ui", "map",
-                "merchant_room", "modifiers", "monsters", "orbs", "potion_lab",
-                "potions", "powers", "relic_collection", "relics", "rest_site_ui",
-                "run_history", "settings_ui", "static_hover_tips", "stats_screen",
-                "timeline", "vfx"
-            };
-            foreach (var name in tableNames)
-                tables[name] = new LocTable(name, new Dictionary<string, string>());
+
+            var locDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "localization_eng");
+            if (Directory.Exists(locDir))
+            {
+                foreach (var file in Directory.GetFiles(locDir, "*.json"))
+                {
+                    try
+                    {
+                        var name = Path.GetFileNameWithoutExtension(file);
+                        var data = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(
+                            File.ReadAllText(file));
+                        if (data != null)
+                            tables[name] = new LocTable(name, data);
+                    }
+                    catch { }
+                }
+                Console.Error.WriteLine($"[INFO] Loaded {tables.Count} localization tables from {locDir}");
+            }
+            else
+            {
+                Console.Error.WriteLine($"[WARN] Localization dir not found: {locDir}");
+                // Fallback: empty tables
+                var tableNames = new[] {
+                    "achievements","acts","afflictions","ancients","ascension",
+                    "bestiary","card_keywords","card_library","card_reward_ui",
+                    "card_selection","cards","characters","combat_messages",
+                    "credits","enchantments","encounters","epochs","eras",
+                    "events","ftues","game_over_screen","gameplay_ui",
+                    "inspect_relic_screen","intents","main_menu_ui","map",
+                    "merchant_room","modifiers","monsters","orbs","potion_lab",
+                    "potions","powers","relic_collection","relics","rest_site_ui",
+                    "run_history","settings_ui","static_hover_tips","stats_screen",
+                    "timeline","vfx"
+                };
+                foreach (var name in tableNames)
+                    tables[name] = new LocTable(name, new Dictionary<string, string>());
+            }
             tablesField!.SetValue(instance, tables);
 
             // Set Language
@@ -1580,20 +1601,71 @@ public class RunSimulator
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
             try { cultureProp?.SetValue(instance, System.Globalization.CultureInfo.InvariantCulture); } catch { }
 
-            // Initialize _smartFormatter so SmartFormat() doesn't crash
+            // Initialize _smartFormatter — the game uses `new SmartFormatter()`
             try
             {
                 var sfField = typeof(LocManager).GetField("_smartFormatter",
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+                // Dump ALL fields (instance + static)
+                foreach (var f in typeof(LocManager).GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public))
+                    Console.Error.WriteLine($"[DEBUG] LocManager {(f.IsStatic?"static":"inst")} field: {f.Name} ({f.FieldType.Name})");
+                Console.Error.WriteLine($"[DEBUG] sfField: {sfField?.Name ?? "null"} type: {sfField?.FieldType?.Name ?? "null"}");
                 if (sfField != null)
                 {
-                    // Create a SmartFormatter using the SmartFormat library
-                    var smartFormatType = sfField.FieldType; // SmartFormat.SmartFormatter
-                    var sfInstance = System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(smartFormatType);
-                    sfField.SetValue(instance, sfInstance);
+                    try
+                    {
+                        // List constructors to find the right one
+                        var ctors = sfField.FieldType.GetConstructors(
+                            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+                        Console.Error.WriteLine($"[DEBUG] SmartFormatter has {ctors.Length} constructors:");
+                        foreach (var ctor in ctors)
+                        {
+                            var ps = ctor.GetParameters();
+                            Console.Error.WriteLine($"  ({string.Join(", ", ps.Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
+                        }
+                        // Try the one with fewest params
+                        var bestCtor = ctors.OrderBy(c => c.GetParameters().Length).First();
+                        var args2 = bestCtor.GetParameters().Select(p =>
+                            p.HasDefaultValue ? p.DefaultValue :
+                            p.ParameterType.IsValueType ? Activator.CreateInstance(p.ParameterType) : null
+                        ).ToArray();
+                        var sf = bestCtor.Invoke(args2);
+                        // Register extensions using the game's own LoadLocFormatters logic
+                        // Call it via reflection on LocManager instance
+                        try
+                        {
+                            var loadMethod = typeof(LocManager).GetMethod("LoadLocFormatters",
+                                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                            if (loadMethod != null)
+                            {
+                                loadMethod.Invoke(instance, null);
+                                Console.Error.WriteLine("[INFO] SmartFormatter initialized via LoadLocFormatters");
+                            }
+                            else
+                            {
+                                sfField.SetValue(null, sf);
+                                Console.Error.WriteLine("[INFO] SmartFormatter set (no LoadLocFormatters found)");
+                            }
+                        }
+                        catch (Exception lfEx)
+                        {
+                            sfField.SetValue(null, sf);
+                            Console.Error.WriteLine($"[WARN] LoadLocFormatters failed: {lfEx.InnerException?.Message ?? lfEx.Message}");
+                        }
+                    }
+                    catch (Exception sfEx)
+                    {
+                        Console.Error.WriteLine($"[WARN] SmartFormatter create failed: {sfEx.GetType().Name}: {sfEx.Message}");
+                        if (sfEx.InnerException != null)
+                            Console.Error.WriteLine($"  Inner: {sfEx.InnerException.GetType().Name}: {sfEx.InnerException.Message}");
+                    }
+                }
+                else
+                {
+                    Console.Error.WriteLine("[WARN] _smartFormatter field not found in LocManager");
                 }
             }
-            catch (Exception ex) { Console.Error.WriteLine($"[WARN] _smartFormatter init: {ex.Message}"); }
+            catch (Exception ex) { Console.Error.WriteLine($"[WARN] _smartFormatter init: {ex.GetType().Name}: {ex.Message}\n{ex.InnerException?.Message}"); }
 
             // Initialize _engTables to point to _tables (avoid null ref in fallback)
             try
@@ -1609,43 +1681,12 @@ public class RunSimulator
             // Use Harmony to patch methods that need fallback behavior
             var harmony = new Harmony("sts2headless.locpatch");
 
-            // Patch LocString.GetFormattedText to return LocEntryKey directly
-            var getFormattedText = typeof(LocString).GetMethod("GetFormattedText",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public,
-                null, Type.EmptyTypes, null);
-            var gftPrefix = typeof(LocPatches).GetMethod(nameof(LocPatches.GetFormattedTextPrefix),
-                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-            if (getFormattedText != null && gftPrefix != null)
-            {
-                try
-                {
-                    harmony.Patch(getFormattedText, new HarmonyMethod(gftPrefix));
-                    Console.Error.WriteLine("[INFO] Patched LocString.GetFormattedText");
-                }
-                catch (Exception ex2)
-                {
-                    Console.Error.WriteLine($"[WARN] Failed to patch GetFormattedText: {ex2.Message}");
-                }
-            }
+            // With real loc data loaded, we only need fallback patches for:
+            // 1. LocTable.GetRawText — return key for missing entries instead of throwing
+            // 2. LocManager.SmartFormat — _smartFormatter is null, return raw text instead
+            // We do NOT patch GetFormattedText/GetRawText on LocString anymore
+            // so the real localization pipeline works (needed for Neow event etc.)
 
-            // Patch LocString.GetRawText (instance, no params) to return LocEntryKey
-            var getRawTextInst = typeof(LocString).GetMethod("GetRawText",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public,
-                null, Type.EmptyTypes, null);
-            var grtInstPrefix = typeof(LocPatches).GetMethod(nameof(LocPatches.GetRawTextInstancePrefix),
-                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-            if (getRawTextInst != null && grtInstPrefix != null)
-            {
-                try
-                {
-                    harmony.Patch(getRawTextInst, new HarmonyMethod(grtInstPrefix));
-                    Console.Error.WriteLine("[INFO] Patched LocString.GetRawText");
-                }
-                catch (Exception ex3)
-                {
-                    Console.Error.WriteLine($"[WARN] Failed to patch LocString.GetRawText: {ex3.Message}");
-                }
-            }
             var getRawText = typeof(LocTable).GetMethod("GetRawText",
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public,
                 null, new[] { typeof(string) }, null);
