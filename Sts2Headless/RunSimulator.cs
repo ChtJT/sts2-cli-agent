@@ -852,20 +852,18 @@ public class RunSimulator
                     {
                         _eventOptionChosen = true;
                         _lastEventOptionCount = options.Count;
-                        // Run on thread pool so GetSelectedCards can block
+                        // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
                         var task = Task.Run(() => options[optionIndex].Chosen());
-                        // Wait briefly, but if card selection is pending, return early
                         for (int i = 0; i < 100; i++)
                         {
                             _syncCtx.Pump();
-                            if (_cardSelector.HasPending) break;
+                            if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
+                            if (_pendingBundles != null) break;
                             if (task.IsCompleted) break;
                             Thread.Sleep(10);
                         }
-                        if (_cardSelector.HasPending)
+                        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
                         {
-                            // Card selection needed — return to main loop
-                            // DetectDecisionPoint will see the pending and return card_select
                             WaitForActionExecutor();
                             return DetectDecisionPoint();
                         }
@@ -1231,6 +1229,18 @@ public class RunSimulator
                 ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
             };
             if (starCost > 0) cardInfo["star_cost"] = starCost;
+            var kws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
+            if (kws?.Count > 0) cardInfo["keywords"] = kws;
+            if (c.Enchantment != null)
+            {
+                cardInfo["enchantment"] = _loc.Bilingual("enchantments", c.Enchantment.Id.Entry + ".title");
+                try { if (c.Enchantment.Amount != 0) cardInfo["enchantment_amount"] = c.Enchantment.Amount; } catch { }
+            }
+            if (c.Affliction != null)
+            {
+                cardInfo["affliction"] = _loc.Bilingual("afflictions", c.Affliction.Id.Entry + ".title");
+                try { if (c.Affliction.Amount != 0) cardInfo["affliction_amount"] = c.Affliction.Amount; } catch { }
+            }
             return cardInfo;
         }).ToList() ?? new();
 
@@ -1826,11 +1836,20 @@ public class RunSimulator
 
             var stats = new Dictionary<string, object?>();
             try { foreach (var dv in clone.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+
+            // Compare keywords before/after upgrade
+            var oldKws = card.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToHashSet() ?? new();
+            var newKws = clone.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToHashSet() ?? new();
+            var addedKws = newKws.Except(oldKws).ToList();
+            var removedKws = oldKws.Except(newKws).ToList();
+
             return new Dictionary<string, object?>
             {
                 ["cost"] = clone.EnergyCost?.GetResolved() ?? 0,
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["description"] = _loc.Bilingual("cards", card.Id.Entry + ".description"),
+                ["added_keywords"] = addedKws.Count > 0 ? addedKws : null,
+                ["removed_keywords"] = removedKws.Count > 0 ? removedKws : null,
             };
         }
         catch { return null; }
@@ -1867,16 +1886,26 @@ public class RunSimulator
                     ["name"] = _loc.Potion(p.Id.Entry),
                     ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
                     ["vars"] = pvars.Count > 0 ? pvars : null,
+                    ["target_type"] = p.TargetType.ToString(),
                 };
             }).Where(x => x != null).ToList(),
             ["deck_size"] = player.Deck?.Cards?.Count ?? 0,
-            ["deck"] = player.Deck?.Cards?.Select(c => new Dictionary<string, object?>
+            ["deck"] = player.Deck?.Cards?.Select(c =>
             {
-                ["id"] = c.Id.ToString(),
-                ["name"] = _loc.Card(c.Id.Entry),
-                ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
-                ["type"] = c.Type.ToString(),
-                ["upgraded"] = c.IsUpgraded,
+                var dstats = new Dictionary<string, object?>();
+                try { foreach (var dv in c.DynamicVars.Values) dstats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+                var dkws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
+                return new Dictionary<string, object?>
+                {
+                    ["id"] = c.Id.ToString(),
+                    ["name"] = _loc.Card(c.Id.Entry),
+                    ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+                    ["type"] = c.Type.ToString(),
+                    ["upgraded"] = c.IsUpgraded,
+                    ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
+                    ["stats"] = dstats.Count > 0 ? dstats : null,
+                    ["keywords"] = dkws?.Count > 0 ? dkws : null,
+                };
             }).ToList(),
         };
     }

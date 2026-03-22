@@ -291,10 +291,17 @@ def show_player(p, show_deck=False):
         cards = p.get("deck", [])
         if cards:
             print(f"  {c(t('Deck:','牌组:'), 'bold')}")
+            KW_ZH = {"Exhaust": "消耗", "Innate": "固有", "Ethereal": "虚无", "Retain": "保留", "Sly": "奇巧", "Eternal": "永恒", "Unplayable": "不能被打出"}
             for cd in cards:
-                up = c("⬆", "green") if cd.get("upgraded") else ""
+                up = c("+", "green") if cd.get("upgraded") else ""
                 ctype_zh = CARD_TYPE_ZH.get(cd.get("type",""), cd.get("type",""))
-                print(f"    {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(t(cd.get('type',''), ctype_zh), 'dim')}")
+                kws = cd.get("keywords") or []
+                kw_str = " ".join(c(t(k, KW_ZH.get(k, k)), "dim") for k in kws)
+                kw_str = f" [{kw_str}]" if kw_str else ""
+                cd_d = card_desc(cd)
+                print(f"    {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(t(cd.get('type',''), ctype_zh), 'dim')}{kw_str}")
+                if cd_d:
+                    print(f"      {c(cd_d, 'dim')}")
 
 def show_combat(state):
     rnd = state.get("round", 0)
@@ -430,7 +437,15 @@ def show_combat(state):
             if len(lines) > 1:
                 extra_desc = f"  {c(lines[-1], 'dim')}"
 
-        print(f"  {mark} [{card['index']}] {c(n(card['name']), type_color)} ({cost_str}) {stat_str}{extra_desc}"
+        # Show keywords (Innate, Exhaust, Ethereal, etc.)
+        KW_ZH = {"Exhaust": "消耗", "Innate": "固有", "Ethereal": "虚无", "Retain": "保留", "Sly": "奇巧", "Eternal": "永恒", "Unplayable": "不能被打出"}
+        kws = card.get("keywords") or []
+        kw_str = " ".join(c(t(k, KW_ZH.get(k, k)), "dim") for k in kws) if kws else ""
+        if kw_str: kw_str = f" [{kw_str}]"
+        ench = card.get("enchantment")
+        ench_str = f" {c(n(ench), 'magenta')}" if ench else ""
+
+        print(f"  {mark} [{card['index']}] {c(n(card['name']), type_color)}{ench_str} ({cost_str}) {stat_str}{kw_str}{extra_desc}"
               + (f"  {c('→','yellow')}" if target == "AnyEnemy" else ""))
 
 def show_map(state, send_fn=None):
@@ -453,7 +468,7 @@ def show_map(state, send_fn=None):
             for i, ch in enumerate(choices):
                 icon = type_icons.get(ch["type"], "?")
                 ntype = t(ch["type"], NODE_TYPE_ZH.get(ch["type"], ch["type"]))
-                print(f"    [{i}] {c(icon, 'yellow')} {ntype}")
+                print(f"    [{i}] {c(icon, 'yellow')} {ntype}  ({t('col','列')}{ch['col']}, {t('row','行')}{ch['row']})")
             return
 
     # Fallback: simple list
@@ -474,12 +489,16 @@ def show_map(state, send_fn=None):
         ntype = t(ch["type"], NODE_TYPE_ZH.get(ch["type"], ch["type"]))
         print(f"  [{i}] {icon} {ntype}")
 
-def _format_upgrade_preview(stats, aug):
+def _format_upgrade_preview(stats, aug, current_cost=None):
     """Format upgrade preview string."""
     if not aug:
         return None
     aug_stats = aug.get("stats") or {}
     parts = []
+    # Cost change
+    aug_cost = aug.get("cost")
+    if current_cost is not None and aug_cost is not None and aug_cost != current_cost:
+        parts.append(c(f"{t('cost','费用')} {current_cost}→{aug_cost}", "green"))
     # Compare all stats, show changed values with readable names
     all_keys = set(list(stats.keys()) + list(aug_stats.keys()))
     for k in sorted(all_keys):
@@ -491,8 +510,13 @@ def _format_upgrade_preview(stats, aug):
             elif k == "block":
                 parts.append(c(f"{t('blk','格挡')} {old}→{new_val}", "blue"))
             else:
-                # Show value change without raw key name
                 parts.append(c(f"{old}→{new_val}", "green"))
+    # Keyword changes (e.g., Discovery removes Exhaust)
+    KW_ZH = {"Exhaust": "消耗", "Innate": "固有", "Ethereal": "虚无", "Retain": "保留", "Sly": "奇巧", "Eternal": "永恒", "Unplayable": "不能被打出"}
+    for kw in (aug.get("removed_keywords") or []):
+        parts.append(c(f"-{t(kw, KW_ZH.get(kw, kw))}", "green"))
+    for kw in (aug.get("added_keywords") or []):
+        parts.append(c(f"+{t(kw, KW_ZH.get(kw, kw))}", "yellow"))
     return parts
 
 def show_card_reward(state):
@@ -518,7 +542,7 @@ def show_card_reward(state):
         if cd_desc:
             print(f"      {c(cd_desc, 'dim')}")
         # Show upgrade preview
-        aug_parts = _format_upgrade_preview(stats, card.get("after_upgrade"))
+        aug_parts = _format_upgrade_preview(stats, card.get("after_upgrade"), card.get("cost"))
         if aug_parts:
             print(f"      {c(t('upgrade:','升级:'), 'green')} {', '.join(aug_parts)}")
 
@@ -1109,7 +1133,7 @@ def play(character="Ironclad", seed=None, auto=False):
                     print(f"  [{cd['index']}] {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(ctype_label, 'dim')}")
                     if cd_desc_text:
                         print(f"      {c(cd_desc_text, 'dim')}")
-                    aug_parts = _format_upgrade_preview(stats, cd.get("after_upgrade"))
+                    aug_parts = _format_upgrade_preview(stats, cd.get("after_upgrade"), cd.get("cost"))
                     if aug_parts:
                         print(f"      {c(t('upgrade:','升级:'), 'green')} {', '.join(aug_parts)}")
 

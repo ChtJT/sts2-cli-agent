@@ -1,24 +1,45 @@
-Launch 5 subagents in parallel, each playing sts2-cli as a different character (Ironclad, Silent, Defect, Regent, Necrobinder). Each subagent plays $ARGUMENTS games (default: 3) by **making its own LLM decisions** — reading JSON game state, thinking about strategy, and choosing actions.
+Launch 5 subagents in parallel, each playing sts2-cli as a different character (Ironclad, Silent, Defect, Regent, Necrobinder). Each subagent plays $ARGUMENTS games (default: 3) by **making its own LLM decisions**.
 
-Each subagent must:
+## What to check for bugs
 
-1. Start the game process via JSON protocol
-2. At each decision point, read the full state and make an intelligent choice
-3. Play through complete runs (until game_over)
-4. Report back:
-   - **Results**: floor reached, win/loss, key moments
-   - **Bugs**: crashes, template leaks `[VarName]`, untranslated text, auto-selected choices, missing data, display issues
-   - **Strategy**: what worked, what didn't, hardest enemies
-   - **Character-specific**: orbs (Defect), stars (Regent), osty (Necrobinder), poison/shivs (Silent)
+Each subagent must verify these mechanics work correctly:
 
-After all 5 agents return, the main agent should:
-1. Summarize all bugs across characters
-2. Fix every bug found
-3. Run regression test: `python3 python/test_quality.py` + `play_full_run.py 5` per character
-4. Update `learning.md` with strategy learnings
-5. Commit with descriptive message (ask user before pushing)
+### Card display
+- **Stats**: damage, block, and other DynamicVars resolved in description (no `[VarName]` leaks)
+- **Keywords**: Exhaust(消耗), Innate(固有), Ethereal(虚无), Retain(保留), Sly(奇巧), Eternal(永恒), Unplayable(不能被打出)
+- **Enchantments**: Clone(克隆), Sharp(锋利), Nimble(灵巧), etc. — shown with name and amount
+- **Afflictions**: Bound, Hexed, etc. — shown on affected cards
+- **Upgrade preview**: stat changes, cost changes, keyword add/remove (e.g., Discovery removes Exhaust)
+- **Star cost**: Regent cards show ⭐ cost
 
-**Subagent game setup:**
+### Character mechanics
+- **Defect**: orbs (Lightning/Frost/Dark/Plasma/Glass) with passive/evoke values, orb_slots count
+- **Regent**: stars count, star-cost cards gated by can_play
+- **Necrobinder**: Osty HP/MaxHP/Block/alive, grows per turn, resets per combat
+- **Silent**: Neutralize deals damage + Weak (Harmony patched)
+
+### Events & rewards
+- Event names localized (涅奥 not Neow)
+- Event option descriptions with resolved template vars ({Gold}→150)
+- Card rewards let user choose (not auto-selected)
+- Event-triggered card rewards (Lost Box, Brain Leech) block for user choice
+- Scroll Boxes (bundle_select) respond quickly, not slow
+
+### Map
+- Current position shown (green [x] or "你在起点")
+- Choices show column/row coordinates to match grid
+- Connection lines between rows
+
+### Display quality
+- All text in correct language (zh or en based on LANG)
+- No raw loc keys (UPPERCASE.dotted.paths)
+- No BBCode tags ([gold]...[/gold])
+- Potion descriptions resolved
+- Relic descriptions resolved
+- Deck view shows card effects and keywords
+
+## How to play
+
 ```python
 import json, subprocess, os
 os.environ["STS2_GAME_DIR"] = os.path.expanduser("~/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_arm64")
@@ -34,15 +55,13 @@ def send(cmd):
     return read()
 ```
 
-**Key commands:**
-- `{"cmd": "start_run", "character": "Ironclad", "seed": "test_1"}`
-- `{"cmd": "action", "action": "play_card", "args": {"card_index": 0, "target_index": 0}}` (target_index only for AnyEnemy cards)
-- `{"cmd": "action", "action": "end_turn"}`
-- `{"cmd": "action", "action": "select_map_node", "args": {"col": X, "row": Y}}`
-- `{"cmd": "action", "action": "select_card_reward", "args": {"card_index": N}}` / `skip_card_reward`
-- `{"cmd": "action", "action": "choose_option", "args": {"option_index": N}}`
-- `{"cmd": "action", "action": "leave_room"}`
-- `{"cmd": "action", "action": "select_cards", "args": {"indices": "0"}}`
-- `{"cmd": "action", "action": "select_bundle", "args": {"bundle_index": 0}}`
+**Commands**: start_run, select_map_node(col,row), play_card(card_index, target_index), end_turn, select_card_reward(card_index), skip_card_reward, choose_option(option_index), leave_room, select_cards(indices), select_bundle(bundle_index), use_potion(potion_index, target_index)
 
-**Decision types:** map_select, combat_play, card_reward, card_select, bundle_select, rest_site, event_choice, shop, game_over
+## After agents complete
+
+1. Collect all bugs
+2. Fix bugs
+3. Run regression: `python3 python/play_full_run.py 5 <char>` for each char
+4. Run quality test: `python3 python/test_quality.py`
+5. Update learning.md
+6. Commit (ask user first)
