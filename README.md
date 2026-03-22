@@ -78,7 +78,6 @@ Each command returns a JSON decision point (`map_select` / `combat_play` / `card
 | Defect | 🚧 Orbs not displayed yet |
 | Necrobinder | 🚧 Minion (Osty) not displayed yet |
 | Regent | 🚧 Stars not displayed yet |
-| Deprived | ⚙️ Debug character |
 
 ## Architecture
 
