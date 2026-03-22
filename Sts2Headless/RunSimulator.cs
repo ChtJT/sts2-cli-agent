@@ -128,13 +128,21 @@ internal class LocLookup
     public string? En(string table, string key) => _eng.GetValueOrDefault(table)?.GetValueOrDefault(key);
     public string? Zh(string table, string key) => _zhs.GetValueOrDefault(table)?.GetValueOrDefault(key);
 
+    /// <summary>Strip BBCode tags like [gold], [/blue], [b], [sine], etc.</summary>
+    private static string StripBBCode(string text)
+    {
+        return System.Text.RegularExpressions.Regex.Replace(text, @"\[/?[a-zA-Z_][a-zA-Z0-9_=]*\]", "");
+    }
+
     /// <summary>Return {en, zh} dict for JSON output.</summary>
     public Dictionary<string, string?> Bilingual(string table, string key)
     {
+        var en = _eng.GetValueOrDefault(table)?.GetValueOrDefault(key) ?? key;
+        var zh = _zhs.GetValueOrDefault(table)?.GetValueOrDefault(key);
         return new Dictionary<string, string?>
         {
-            ["en"] = _eng.GetValueOrDefault(table)?.GetValueOrDefault(key) ?? key,
-            ["zh"] = _zhs.GetValueOrDefault(table)?.GetValueOrDefault(key),
+            ["en"] = StripBBCode(en),
+            ["zh"] = zh != null ? StripBBCode(zh) : null,
         };
     }
 
@@ -335,11 +343,10 @@ public class RunSimulator
 
         Log($"Moving to map coord ({col},{row})");
 
-        // Enqueue and execute the move action
-        var moveAction = new MoveToMapCoordAction(player, coord);
-        RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(moveAction);
-
-        // Wait for the action executor to finish
+        // Call EnterMapCoord directly (same as what MoveToMapCoordAction does in TestMode)
+        // This avoids the action executor which can swallow errors silently.
+        RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+        _syncCtx.Pump();
         WaitForActionExecutor();
 
         return DetectDecisionPoint();
@@ -393,9 +400,18 @@ public class RunSimulator
 
         Log($"Playing card {card.GetType().Name} (index {cardIndex}) targeting {(target != null ? target.Monster?.GetType().Name ?? "creature" : "none")}");
 
+        var handCountBefore = hand.Count;
+
         var playAction = new PlayCardAction(card, target);
         RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(playAction);
         WaitForActionExecutor();
+
+        // Check if card play had no effect (hand unchanged, same card still at same index)
+        var handAfter = pcs.Hand.Cards;
+        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
+        {
+            return Error("Card could not be played");
+        }
 
         return DetectDecisionPoint();
     }
@@ -425,9 +441,19 @@ public class RunSimulator
         _turnStarted.Reset();
         _combatEnded.Reset();
 
-        // With Task.Yield() patched out of sts2.dll, EndTurn should complete synchronously.
-        PlayerCmd.EndTurn(player, canBackOut: false);
-        _syncCtx.Pump();
+        // Enable SuppressYield so Task.Yield() runs inline during enemy turn processing.
+        // This prevents deadlocks during boss fights (e.g., Vantom) where continuations
+        // would otherwise be posted to ThreadPool and never complete.
+        YieldPatches.SuppressYield = true;
+        try
+        {
+            PlayerCmd.EndTurn(player, canBackOut: false);
+            _syncCtx.Pump();
+        }
+        finally
+        {
+            YieldPatches.SuppressYield = false;
+        }
 
         // Fallback: if turn didn't complete synchronously, wait briefly then force retry
         if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
@@ -737,23 +763,30 @@ public class RunSimulator
             }
         }
 
-        // Auto-target: self-targeting potions target the player, enemy-targeting target first enemy
-        if (target == null && CombatManager.Instance.IsInProgress)
+        // Auto-target based on potion's target type
+        if (target == null)
         {
             var targetType = potion.TargetType;
-            if (targetType == TargetType.Self || targetType == TargetType.TargetedNoCreature)
+            if (CombatManager.Instance.IsInProgress)
             {
-                target = player.Creature;
-            }
-            else if (targetType == TargetType.AnyEnemy)
-            {
-                var combatState = CombatManager.Instance.DebugOnlyGetState();
-                target = combatState?.Enemies?.FirstOrDefault(e => e != null && e.IsAlive);
+                if (targetType == TargetType.Self || targetType == TargetType.TargetedNoCreature)
+                {
+                    target = player.Creature;
+                }
+                else if (targetType == TargetType.AnyEnemy)
+                {
+                    var combatState = CombatManager.Instance.DebugOnlyGetState();
+                    target = combatState?.Enemies?.FirstOrDefault(e => e != null && e.IsAlive);
+                }
+                // All other target types (None, All, etc.) → leave target as null
             }
             else
             {
-                // Default to player for non-combat or unknown target types
-                target = player.Creature;
+                // Outside combat: only Self targeting potions get target
+                if (targetType == TargetType.Self)
+                {
+                    target = player.Creature;
+                }
             }
         }
 
@@ -766,7 +799,7 @@ public class RunSimulator
             _syncCtx.Pump();
             // Verify potion was consumed
             var afterPotions = player.Potions?.ToList() ?? new();
-            if (idx < afterPotions.Count && afterPotions[idx] == potion)
+            if (afterPotions.Contains(potion))
             {
                 // Potion wasn't consumed — manually discard it
                 Log("Potion not consumed by action, manually discarding");
@@ -899,7 +932,12 @@ public class RunSimulator
         if (room is RestSiteRoom || room is MerchantRoom || room is EventRoom || room is TreasureRoom)
         {
             Log("Force leaving non-combat room to map");
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+            try
+            {
+                RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
+                _syncCtx.Pump();
+                WaitForActionExecutor();
+            }
             catch (Exception ex) { Log($"Force leave: {ex.Message}"); }
         }
         return DetectDecisionPoint();
@@ -1072,7 +1110,7 @@ public class RunSimulator
             {
                 return CombatPlayState(player);
             }
-            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
+            if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead))
             {
                 return DetectPostCombatState(player, combatRoom);
             }
@@ -1147,14 +1185,36 @@ public class RunSimulator
         if (currentCoord.HasValue)
         {
             var currentPoint = map.GetPoint(currentCoord.Value);
-            choices = currentPoint.Children
-                .Select(child => new Dictionary<string, object?>
+            if (currentPoint == null)
+            {
+                Log($"GetPoint returned null for coord ({currentCoord.Value.col},{currentCoord.Value.row}), falling back to start");
+                // Current coord is invalid (stale after forced room transition); treat as no position
+                choices = new List<Dictionary<string, object?>>();
+                var sp = map.StartingMapPoint;
+                if (sp?.Children != null)
                 {
-                    ["col"] = (int)child.coord.col,
-                    ["row"] = (int)child.coord.row,
-                    ["type"] = child.PointType.ToString(),
-                })
-                .ToList();
+                    foreach (var child in sp.Children)
+                    {
+                        choices.Add(new Dictionary<string, object?>
+                        {
+                            ["col"] = (int)child.coord.col,
+                            ["row"] = (int)child.coord.row,
+                            ["type"] = child.PointType.ToString(),
+                        });
+                    }
+                }
+            }
+            else
+            {
+                choices = (currentPoint.Children ?? Enumerable.Empty<MapPoint>())
+                    .Select(child => new Dictionary<string, object?>
+                    {
+                        ["col"] = (int)child.coord.col,
+                        ["row"] = (int)child.coord.row,
+                        ["type"] = child.PointType.ToString(),
+                    })
+                    .ToList();
+            }
         }
         else
         {
@@ -1915,13 +1975,33 @@ public class RunSimulator
     private Dictionary<string, object?> RunContext()
     {
         if (_runState == null) return new();
-        return new Dictionary<string, object?>
+        var ctx = new Dictionary<string, object?>
         {
             ["act"] = _runState.CurrentActIndex + 1,
             ["act_name"] = _loc.Act(_runState.Act?.Id.Entry ?? "OVERGROWTH"),
             ["floor"] = _runState.ActFloor,
             ["room_type"] = _runState.CurrentRoom?.RoomType.ToString(),
         };
+
+        // Boss encounter info — use BossEncounter?.Id?.Entry
+        try
+        {
+            var bossIdEntry = _runState.Act?.BossEncounter?.Id?.Entry;
+            if (!string.IsNullOrEmpty(bossIdEntry))
+            {
+                var monsterKey = bossIdEntry.EndsWith("_BOSS") ? bossIdEntry[..^5] : bossIdEntry;
+                // Handle special mappings
+                if (monsterKey == "THE_KIN") monsterKey = "KIN_PRIEST";
+                ctx["boss"] = new Dictionary<string, object?>
+                {
+                    ["id"] = bossIdEntry,
+                    ["name"] = _loc.Monster(monsterKey),
+                };
+            }
+        }
+        catch { }
+
+        return ctx;
     }
 
     private static void EnsureModelDbInitialized()
@@ -1954,8 +2034,9 @@ public class RunSimulator
         try { SaveManager.Instance.InitProgressData(); }
         catch (Exception ex) { Console.Error.WriteLine($"[WARN] InitProgressData: {ex.Message}"); }
 
-        // Task.Yield patch disabled — causes re-entrancy issues.
-        // PatchTaskYield();
+        // Install the Task.Yield patch but keep SuppressYield=false by default.
+        // SuppressYield is toggled to true only during EndTurn to prevent boss fight deadlocks.
+        PatchTaskYield();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
@@ -2580,6 +2661,20 @@ public class RunSimulator
             ["row"] = (int)map.BossMapPoint.coord.row,
             ["type"] = map.BossMapPoint.PointType.ToString(),
         };
+
+        // Add boss name/id — use BossEncounter?.Id?.Entry
+        try
+        {
+            var bossIdEntry = _runState.Act?.BossEncounter?.Id?.Entry;
+            if (!string.IsNullOrEmpty(bossIdEntry))
+            {
+                var monsterKey = bossIdEntry.EndsWith("_BOSS") ? bossIdEntry[..^5] : bossIdEntry;
+                if (monsterKey == "THE_KIN") monsterKey = "KIN_PRIEST";
+                bossNode["id"] = bossIdEntry;
+                bossNode["name"] = _loc.Monster(monsterKey);
+            }
+        }
+        catch { }
 
         return new Dictionary<string, object?>
         {
