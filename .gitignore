@@ -12,4 +12,7 @@ obj/
 .DS_Store
 .obsidian/
 learning.md
+learning_*.md
+bug.md
+play_*.py
 CLAUDE.md
