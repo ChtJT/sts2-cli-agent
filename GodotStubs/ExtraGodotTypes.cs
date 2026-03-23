@@ -56,7 +56,10 @@ public class StyleBoxEmpty : Resource { }
 public class GradientTexture2D : Texture2D { }
 public class Gradient : Resource { }
 
-public class ParticleProcessMaterial : Material { }
+public class ParticleProcessMaterial : Material
+{
+    public Vector3 EmissionBoxExtents { get; set; }
+}
 
 public class RenderingServer
 {

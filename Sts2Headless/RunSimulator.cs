@@ -471,7 +471,7 @@ public class RunSimulator
             // Cancel the ActionExecutor to break out, then re-trigger EndTurn.
             if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
             {
-                Log("EndTurn stuck, cancelling and retrying...");
+                Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
                 try
                 {
                     RunManager.Instance.ActionExecutor.Cancel();
@@ -479,22 +479,95 @@ public class RunSimulator
                     Thread.Sleep(50);
                     _syncCtx.Pump();
 
-                    // Reset the player ready state and try again
+                    // Reset the player ready state and try again with SuppressYield
                     CombatManager.Instance.UndoReadyToEndTurn(player);
                     _syncCtx.Pump();
-                    PlayerCmd.EndTurn(player, canBackOut: false);
-                    _syncCtx.Pump();
 
-                    for (int i = 0; i < 50; i++)
+                    YieldPatches.SuppressYield = true;
+                    try
+                    {
+                        PlayerCmd.EndTurn(player, canBackOut: false);
+                        _syncCtx.Pump();
+                    }
+                    finally
+                    {
+                        YieldPatches.SuppressYield = false;
+                    }
+
+                    for (int i = 0; i < 100; i++)
                     {
                         _syncCtx.Pump();
                         if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                         if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
                         if (CombatManager.Instance.IsPlayPhase) break;
-                        Thread.Sleep(5);
+                        Thread.Sleep(10);
                     }
                 }
                 catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
+            }
+
+            // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
+            // the enemy turn processing to complete with SuppressYield permanently on.
+            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+            {
+                var stuckState = CombatManager.Instance.DebugOnlyGetState();
+                var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
+                    .Select(e => $"{e.Monster?.GetType().Name}(hp={e.CurrentHp})").ToList();
+                Log($"EndTurn STILL stuck after retry — nuclear fallback. Round={stuckState?.RoundNumber}, " +
+                    $"Enemies=[{string.Join(",", stuckEnemies ?? new())}], " +
+                    $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}, " +
+                    $"IsInProgress={CombatManager.Instance.IsInProgress}, " +
+                    $"ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
+                try
+                {
+                    // Cancel again and undo
+                    RunManager.Instance.ActionExecutor.Cancel();
+                    _syncCtx.Pump();
+                    CombatManager.Instance.UndoReadyToEndTurn(player);
+                    _syncCtx.Pump();
+                    Thread.Sleep(50);
+
+                    // Run EndTurn on ThreadPool with SuppressYield permanently on
+                    YieldPatches.SuppressYield = true;
+                    var endTurnTask = Task.Run(() =>
+                    {
+                        PlayerCmd.EndTurn(player, canBackOut: false);
+                    });
+
+                    // Aggressively pump sync context while waiting (up to 5 seconds)
+                    for (int i = 0; i < 500; i++)
+                    {
+                        _syncCtx.Pump();
+                        if (endTurnTask.IsCompleted) break;
+                        if (_turnStarted.IsSet || _combatEnded.IsSet) break;
+                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                        if (CombatManager.Instance.IsPlayPhase) break;
+                        Thread.Sleep(10);
+                    }
+                    YieldPatches.SuppressYield = false;
+
+                    // If still not play phase, try just waiting a bit more
+                    if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+                    {
+                        for (int i = 0; i < 200; i++)
+                        {
+                            _syncCtx.Pump();
+                            Thread.Sleep(10);
+                            if (CombatManager.Instance.IsPlayPhase || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
+                                break;
+                        }
+                    }
+
+                    if (CombatManager.Instance.IsPlayPhase)
+                        Log("Nuclear fallback SUCCEEDED — play phase resumed");
+                    else
+                        Log("Nuclear fallback FAILED — returning stuck state");
+                }
+                catch (Exception ex)
+                {
+                    Log($"Nuclear fallback error: {ex.Message}");
+                    YieldPatches.SuppressYield = false;
+                }
             }
         }
 
@@ -750,45 +823,37 @@ public class RunSimulator
         var potion = potionsList[idx];
         if (potion == null) return Error($"No potion at index {idx}");
 
+        // Determine target based on potion's TargetType first, then fall back to target_index
         Creature? target = null;
-        if (args.TryGetValue("target_index", out var tObj) && tObj != null)
-        {
-            var targetIdx = Convert.ToInt32(tObj);
-            var combatState = CombatManager.Instance.DebugOnlyGetState();
-            if (combatState != null)
-            {
-                var enemies = combatState.Enemies.Where(e => e != null && e.IsAlive).ToList();
-                if (targetIdx >= 0 && targetIdx < enemies.Count)
-                    target = enemies[targetIdx];
-            }
-        }
+        var potionTargetType = potion.TargetType;
 
-        // Auto-target based on potion's target type
-        if (target == null)
+        // Self-targeting potions (Flex, Fortifier, etc.) ALWAYS target the player
+        // regardless of any target_index the caller provides
+        if (potionTargetType == TargetType.Self || potionTargetType == TargetType.TargetedNoCreature)
         {
-            var targetType = potion.TargetType;
-            if (CombatManager.Instance.IsInProgress)
+            target = player.Creature;
+        }
+        else if (potionTargetType == TargetType.AnyEnemy)
+        {
+            // Use caller's target_index if provided, otherwise pick first alive enemy
+            if (args.TryGetValue("target_index", out var tObj) && tObj != null)
             {
-                if (targetType == TargetType.Self || targetType == TargetType.TargetedNoCreature)
+                var targetIdx = Convert.ToInt32(tObj);
+                var combatState = CombatManager.Instance.DebugOnlyGetState();
+                if (combatState != null)
                 {
-                    target = player.Creature;
+                    var enemies = combatState.Enemies.Where(e => e != null && e.IsAlive).ToList();
+                    if (targetIdx >= 0 && targetIdx < enemies.Count)
+                        target = enemies[targetIdx];
                 }
-                else if (targetType == TargetType.AnyEnemy)
-                {
-                    var combatState = CombatManager.Instance.DebugOnlyGetState();
-                    target = combatState?.Enemies?.FirstOrDefault(e => e != null && e.IsAlive);
-                }
-                // All other target types (None, All, etc.) → leave target as null
             }
-            else
+            if (target == null && CombatManager.Instance.IsInProgress)
             {
-                // Outside combat: only Self targeting potions get target
-                if (targetType == TargetType.Self)
-                {
-                    target = player.Creature;
-                }
+                var combatState = CombatManager.Instance.DebugOnlyGetState();
+                target = combatState?.Enemies?.FirstOrDefault(e => e != null && e.IsAlive);
             }
         }
+        // All other target types (None, All, etc.) → leave target as null
 
         Log($"Using potion: {potion.GetType().Name} at slot {idx} target={target?.GetType().Name ?? "none"}");
         try
@@ -842,7 +907,7 @@ public class RunSimulator
         Log($"Choosing option {optionIndex}");
 
         // Dispatch based on ROOM TYPE (not event state) to avoid cross-contamination
-        if (_runState?.CurrentRoom is RestSiteRoom)
+        if (_runState?.CurrentRoom is RestSiteRoom restSiteRoom)
         {
             Log($"Rest site: choosing option {optionIndex}");
             try
@@ -867,6 +932,16 @@ public class RunSimulator
             catch (Exception ex)
             {
                 Log($"Rest site ChooseLocalOption failed: {ex.Message}");
+            }
+
+            // After non-Smith rest site options (HEAL, etc.), the options may not clear.
+            // Force transition to map to prevent infinite rest_site loop.
+            if (!_cardSelector.HasPending)
+            {
+                Log("Rest site: option chosen (non-Smith), forcing to map");
+                WaitForActionExecutor();
+                ForceToMap();
+                return MapSelectState();
             }
         }
         // For events — use EventSynchronizer
@@ -2038,6 +2113,12 @@ public class RunSimulator
         // SuppressYield is toggled to true only during EndTurn to prevent boss fight deadlocks.
         PatchTaskYield();
 
+        // Patch Cmd.Wait to be a no-op in headless mode.
+        // Cmd.Wait(duration) is used for UI animations (e.g., PreviewCardPileAdd during
+        // Vantom's Dismember move adding Wounds). In headless mode, these never complete
+        // because there's no Godot scene tree, causing the ActionExecutor to deadlock.
+        PatchCmdWait();
+
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
 
@@ -2083,6 +2164,78 @@ public class RunSimulator
             "necrobinder" => Player.CreateForNewRun<Necrobinder>(UnlockState.all, 1uL),
             _ => null
         };
+    }
+
+    private static void PatchCmdWait()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.cmdwait");
+            // Find Cmd.Wait(float) — it's in MegaCrit.Sts2.Core.Commands namespace
+            // Find Cmd type via CardPileCmd's assembly (both are in same namespace)
+            var cmdPileType = typeof(MegaCrit.Sts2.Core.Commands.CardPileCmd);
+            var cmdAsm = cmdPileType.Assembly;
+            Type? cmdType = cmdAsm.GetType("MegaCrit.Sts2.Core.Commands.Cmd");
+            // If not found by exact name, search by namespace + "Wait" method
+            if (cmdType == null)
+            {
+                foreach (var t in cmdAsm.GetTypes())
+                {
+                    if (t.Namespace == "MegaCrit.Sts2.Core.Commands")
+                    {
+                        var waitM = t.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.DeclaredOnly)
+                            .Where(m => m.Name == "Wait").ToList();
+                        if (waitM.Count > 0)
+                        {
+                            cmdType = t;
+                            Console.Error.WriteLine($"[INFO] Found Wait() in {t.FullName}");
+                            break;
+                        }
+                    }
+                }
+            }
+            if (cmdType != null)
+            {
+                var waitMethod = cmdType.GetMethod("Wait",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
+                    null, new[] { typeof(float) }, null);
+                if (waitMethod != null)
+                {
+                    var prefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.CmdWaitPrefix),
+                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                    if (prefix != null)
+                    {
+                        harmony.Patch(waitMethod, new HarmonyMethod(prefix));
+                        Console.Error.WriteLine("[INFO] Patched Cmd.Wait() to no-op (prevents boss fight deadlocks)");
+                    }
+                }
+                else
+                {
+                    // Try to find any Wait method
+                    var methods = cmdType.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                        .Where(m => m.Name == "Wait").ToList();
+                    foreach (var m in methods)
+                    {
+                        Console.Error.WriteLine($"[INFO] Found Cmd.Wait({string.Join(",", m.GetParameters().Select(p => p.ParameterType.Name))})");
+                        var prefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.CmdWaitPrefix),
+                            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                        if (prefix != null)
+                        {
+                            harmony.Patch(m, new HarmonyMethod(prefix));
+                            Console.Error.WriteLine($"[INFO] Patched Cmd.Wait variant");
+                        }
+                    }
+                }
+            }
+            else
+            {
+                Console.Error.WriteLine("[WARN] Could not find MegaCrit.Sts2.Core.Commands.Cmd type");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch Cmd.Wait: {ex.Message}");
+        }
     }
 
     private static void PatchTaskYield()
@@ -2240,6 +2393,13 @@ public class RunSimulator
                 return false;
             }
             return true; // Let normal Yield behavior run
+        }
+
+        /// <summary>Harmony prefix: make Cmd.Wait() return completed task immediately (no-op in headless).</summary>
+        public static bool CmdWaitPrefix(ref Task __result)
+        {
+            __result = Task.CompletedTask;
+            return false; // Skip original method
         }
     }
 

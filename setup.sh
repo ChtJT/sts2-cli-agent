@@ -131,6 +131,8 @@ cat > "$PATCH_DIR/Patcher.csproj" << 'PROJ'
 PROJ
 
 cat > "$PATCH_DIR/Program.cs" << 'CSHARP'
+using System;
+using System.IO;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 
@@ -139,7 +141,7 @@ Console.WriteLine($"Patching {dllPath}...");
 
 var resolver = new DefaultAssemblyResolver();
 resolver.AddSearchDirectory(Path.GetDirectoryName(dllPath)!);
-var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver });
+var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver, ReadingMode = ReadingMode.Immediate });
 
 int patches = 0;
 

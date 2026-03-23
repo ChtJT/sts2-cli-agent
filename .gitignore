@@ -11,8 +11,6 @@ obj/
 *.pyc
 .DS_Store
 .obsidian/
-learning.md
-learning_*.md
-bug.md
+agent/
 play_*.py
 CLAUDE.md
