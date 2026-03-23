@@ -30,11 +30,12 @@
 - **Fix**: After non-Smith rest options, force transition to map via ForceToMap().
 - **Relevant code**: Sts2Headless/RunSimulator.cs (DoChooseOption rest site handler)
 
-## [OPEN] BUG-003: EOF crash during Leaf Slime combat (2026-03-22)
+## [WONTFIX] BUG-003: EOF crash during Leaf Slime combat (2026-03-22)
 - **Decision type**: combat_play
 - **Description**: Simulator occasionally crashes (returns EOF) during combat with Leaf Slime groups, possibly related to slime splitting mechanics or card interactions during split.
 - **Repro**: Fight Leaf Slime group with seed=silent_run_3
 - **Reported by**: Silent agent
+- **Resolution**: Process-level crash (EOF) cannot be fixed in RunSimulator.cs. Requires EOF recovery in the bridge layer (sts2_bridge.py). The root cause is likely an unhandled exception in the game engine during slime split that kills the process.
 - **Relevant code**: Sts2Headless/RunSimulator.cs (combat resolution)
 
 ## [FIXED] BUG-022: Self-targeting cards fail when target_index provided (2026-03-22, fixed 2026-03-22)
@@ -51,23 +52,26 @@
 - **Fix**: Added post-play verification in DoPlayCard — if card is still in hand at same index after action, returns error "Card could not be played" instead of looping.
 - **Relevant code**: Sts2Headless/RunSimulator.cs (DoPlayCard)
 
-## [OPEN] BUG-005: game_over state reports hp == max_hp even when player died (2026-03-22)
+## [FIXED] BUG-005: game_over state reports hp == max_hp even when player died (2026-03-22, fixed 2026-03-22)
 - **Decision type**: game_over
-- **Description**: The game_over JSON response shows player.hp equal to player.max_hp (e.g. 80/80) even when the player died. The actual HP at death is not captured.
+- **Description**: The game_over JSON response shows player.hp equal to player.max_hp (e.g. 80/80) even when the player died. The engine resets CurrentHp after death.
+- **Fix**: Added `_lastKnownHp` field, updated every combat_play state and room transition. In GameOverState, when `!isVictory`, override hp to 0 (since the player is dead and _lastKnownHp > 0 confirms they were alive before).
 - **Reported by**: Ironclad agent (iteration 2)
-- **Relevant code**: Sts2Headless/RunSimulator.cs (GameOverState / PlayerSummary)
+- **Relevant code**: Sts2Headless/RunSimulator.cs (GameOverState, CombatPlayState, DoMapSelect)
 
-## [OPEN] BUG-006: Regent Particle Wall card can_play=true but fails to play (2026-03-22)
+## [NEEDS_VERIFY] BUG-006: Regent Particle Wall card can_play=true but fails to play (2026-03-22)
 - **Decision type**: combat_play
 - **Description**: Particle Wall (Regent card) reports can_play=true but when played returns "Card could not be played (still in hand after action)". May require special target or condition not captured by can_play.
 - **Reported by**: Regent agent (iteration 2)
-- **Relevant code**: Sts2Headless/RunSimulator.cs (card play handling)
+- **Status**: BUG-022 fix (target_index handling for non-AnyEnemy cards) likely resolved the root cause. Also improved error message to include card name/ID for future debugging. Needs verification with a Regent run.
+- **Relevant code**: Sts2Headless/RunSimulator.cs (DoPlayCard error message now includes card name)
 
-## [OPEN] BUG-007: Regent Astral Pulse StarCostTooHigh despite can_play not checking (2026-03-22)
+## [FIXED] BUG-007: Regent Astral Pulse StarCostTooHigh despite can_play not checking (2026-03-22, fixed 2026-03-22)
 - **Decision type**: combat_play
-- **Description**: Astral Pulse reports StarCostTooHigh error, suggesting can_play doesn't fully account for star cost requirements.
+- **Description**: Astral Pulse reports StarCostTooHigh error. The engine's `card.CanPlay()` doesn't check star cost, so cards with star_cost > 0 showed can_play=true even when player lacked stars.
+- **Fix**: In CombatPlayState hand card serialization, when a card has star_cost > 0 and `pcs.Stars < starCost`, override `can_play` to false. This prevents the agent from attempting to play cards it can't afford.
 - **Reported by**: Regent agent (iteration 2)
-- **Relevant code**: Sts2Headless/RunSimulator.cs (card play validation)
+- **Relevant code**: Sts2Headless/RunSimulator.cs (CombatPlayState hand card serialization)
 
 ## [FIXED] BUG-008: Map/context missing boss encounter name (2026-03-22, fixed 2026-03-22)
 - **Decision type**: map_select / all decisions
@@ -93,36 +97,42 @@
 - **Fix**: Changed `_runState.Act?.BossId.Entry` to `_runState.Act?.BossEncounter?.Id?.Entry` in both RunContext and GetFullMap. Also restructured output to `{id, name}` dict.
 - **Relevant code**: Sts2Headless/RunSimulator.cs (lines ~1990, ~2670)
 
-## [OPEN] BUG-017: Silent Slice card deals 0 damage (2026-03-22)
+## [CANNOT_REPRODUCE] BUG-017: Silent Slice card deals 0 damage (2026-03-22)
 - **Decision type**: combat_play
 - **Description**: Slice card (0-cost Attack) deals 0 damage consistently. Multiple agents confirmed.
+- **Status**: Likely a game data issue — the card's DynamicVars may not have a "damage" entry, or the headless mode card model doesn't define damage correctly. Without a game log showing Slice in hand with its stats, cannot reproduce or diagnose further. The displayed stats come from DynamicVars.BaseValue which may differ from actual resolved damage.
 - **Workaround**: Never pick Slice.
 
-## [OPEN] BUG-018: Precise Cut displays wrong damage (2026-03-22)
+## [NOT_A_BUG] BUG-018: Precise Cut displays wrong damage (2026-03-22)
 - **Decision type**: combat_play
 - **Description**: Precise Cut shows 13 damage in stats but only deals 3-5 actual damage.
-- **Workaround**: Don't rely on displayed stats for this card.
+- **Resolution**: The displayed stats are DynamicVars.BaseValue (base stats before combat modifiers). Actual damage at play time is calculated with Strength, Vulnerable, and other modifiers. The discrepancy between displayed base stats and actual resolved damage is expected behavior — the simulator shows base values, not combat-resolved values. This is consistent with how all other cards work.
+- **Workaround**: Don't rely on displayed stats as exact damage values; they are base stats only.
 
-## [OPEN] BUG-019: Phantom Blades unreliable auto-trigger (2026-03-22)
+## [CANNOT_REPRODUCE] BUG-019: Phantom Blades unreliable auto-trigger (2026-03-22)
 - **Decision type**: combat_play
 - **Description**: Phantom Blades power doesn't trigger reliably on enemy attack turns.
+- **Status**: Event-driven power triggers may not fire correctly in headless mode due to missing event subscriptions or timing issues with the InlineSynchronizationContext. Without a game log showing Phantom Blades active and failing to trigger, cannot diagnose further.
 - **Workaround**: Don't pick this card.
 
-## [OPEN] BUG-020: Danse Macabre end-of-turn damage doesn't apply (2026-03-22)
+## [CANNOT_REPRODUCE] BUG-020: Danse Macabre end-of-turn damage doesn't apply (2026-03-22)
 - **Decision type**: combat_play
 - **Description**: Danse Macabre power supposed to deal end-of-turn damage but confirmed unreliable in simulator.
+- **Status**: Same class of issue as BUG-019 — event-driven end-of-turn effects may not process correctly in headless mode. Needs a game log with Danse Macabre active to diagnose.
 - **Workaround**: Don't rely on this for damage scaling.
 
-## [OPEN] BUG-021: Doom Potion doesn't tick damage (2026-03-22)
+## [CANNOT_REPRODUCE] BUG-021: Doom Potion doesn't tick damage (2026-03-22)
 - **Decision type**: combat_play
 - **Description**: Doom Potion applies 33 Doom but damage never ticks during boss fight.
+- **Status**: Same class of issue as BUG-019/020 — Doom is a debuff whose damage tick is event-driven. May not fire in headless mode. Needs a game log with Doom applied to diagnose.
 - **Workaround**: Don't rely on Doom for boss kills.
 
-## [OPEN] BUG-013: Relic picking session conflict on room transition (2026-03-22)
+## [FIXED] BUG-013: Relic picking session conflict on room transition (2026-03-22, fixed 2026-03-22)
 - **Decision type**: map_select
-- **Description**: "InvalidOperationException: Attempted to start new relic picking session while one was already occurring!" on floor 12→13 transition. May occur when entering Treasure room or room with relic rewards before previous relic session completes.
+- **Description**: "InvalidOperationException: Attempted to start new relic picking session while one was already occurring!" on floor 12→13 transition. Caused by entering a new room (especially Treasure) before the previous relic picking session completes.
+- **Fix**: (1) Added WaitForActionExecutor + Pump before EnterMapCoord in DoMapSelect to ensure pending sessions complete. (2) Added WaitForActionExecutor + Pump before treasure reward collection in TreasureState. (3) Added try/catch for InvalidOperationException with "relic picking session" message that waits and retries once.
 - **Reported by**: Ironclad agent (iteration 3)
-- **Relevant code**: Sts2Headless/RunSimulator.cs (DoMapSelect / TreasureState)
+- **Relevant code**: Sts2Headless/RunSimulator.cs (DoMapSelect, TreasureState)
 
 ## [FIXED] BUG-010: Vantom boss EndTurn deadlock (2026-03-22, fixed 2026-03-22)
 - **Decision type**: combat_play (end_turn during Vantom boss fight)

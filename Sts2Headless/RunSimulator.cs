@@ -202,6 +202,7 @@ public class RunSimulator
     private CardReward? _pendingCardReward;
     private bool _rewardsProcessed;
     private int _goldBeforeCombat;
+    private int _lastKnownHp;
     private readonly HeadlessCardSelector _cardSelector = new();
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
@@ -336,12 +337,17 @@ public class RunSimulator
         _eventOptionChosen = false;
         _lastEventOptionCount = 0;
         _pendingRewards = null;
+        _lastKnownHp = player.Creature?.CurrentHp ?? 0;
 
         var col = Convert.ToInt32(args["col"]);
         var row = Convert.ToInt32(args["row"]);
         var coord = new MapCoord((byte)col, (byte)row);
 
         Log($"Moving to map coord ({col},{row})");
+
+        // BUG-013: Wait for any pending actions (relic sessions, etc.) to complete before entering new room
+        WaitForActionExecutor();
+        _syncCtx.Pump();
 
         // Call EnterMapCoord directly (same as what MoveToMapCoordAction does in TestMode)
         // This avoids the action executor which can swallow errors silently.
@@ -414,7 +420,7 @@ public class RunSimulator
         var handAfter = pcs.Hand.Cards;
         if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
         {
-            return Error("Card could not be played");
+            return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
 
         return DetectDecisionPoint();
@@ -1341,6 +1347,10 @@ public class RunSimulator
         var pcs = player.PlayerCombatState;
         var combatState = CombatManager.Instance.DebugOnlyGetState();
 
+        // Track last known HP for accurate game_over reporting (BUG-005)
+        if (player.Creature != null && player.Creature.CurrentHp > 0)
+            _lastKnownHp = player.Creature.CurrentHp;
+
         var hand = pcs?.Hand?.Cards?.Select((c, i) =>
         {
             // Extract actual stat values from DynamicVars
@@ -1367,7 +1377,13 @@ public class RunSimulator
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
             };
-            if (starCost > 0) cardInfo["star_cost"] = starCost;
+            if (starCost > 0)
+            {
+                cardInfo["star_cost"] = starCost;
+                // BUG-007: Override can_play for star-cost cards when player lacks stars
+                if (pcs != null && pcs.Stars < starCost)
+                    cardInfo["can_play"] = false;
+            }
             var kws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
             if (kws?.Count > 0) cardInfo["keywords"] = kws;
             if (c.Enchantment != null)
@@ -1881,12 +1897,32 @@ public class RunSimulator
     {
         // Treasure rooms give relics via TreasureRoomRelicSynchronizer
         Log("Treasure room — collecting rewards");
+
+        // BUG-013: Ensure any pending relic picking session is complete before starting new one
+        WaitForActionExecutor();
+        _syncCtx.Pump();
+
         try
         {
             treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
             _syncCtx.Pump();
             treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
             _syncCtx.Pump();
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
+        {
+            // BUG-013: Relic session conflict — wait for pending session then retry
+            Log($"Relic session conflict, waiting and retrying: {ex.Message}");
+            WaitForActionExecutor();
+            _syncCtx.Pump();
+            try
+            {
+                treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
+                _syncCtx.Pump();
+                treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
+                _syncCtx.Pump();
+            }
+            catch (Exception retryEx) { Log($"Treasure rewards retry failed: {retryEx.Message}"); }
         }
         catch (Exception ex) { Log($"Treasure rewards: {ex.Message}"); }
 
@@ -1897,13 +1933,17 @@ public class RunSimulator
     private Dictionary<string, object?> GameOverState(bool isVictory)
     {
         var player = _runState!.Players[0];
+        var summary = PlayerSummary(player);
+        // BUG-005: When player died, the engine resets HP to max. Use last known HP instead.
+        if (!isVictory)
+            summary["hp"] = _lastKnownHp > 0 ? 0 : (player.Creature?.CurrentHp ?? 0);
         return new Dictionary<string, object?>
         {
             ["type"] = "decision",
             ["decision"] = "game_over",
             ["context"] = RunContext(),
             ["victory"] = isVictory,
-            ["player"] = PlayerSummary(player),
+            ["player"] = summary,
             ["act"] = _runState.CurrentActIndex + 1,
             ["floor"] = _runState.ActFloor,
         };
