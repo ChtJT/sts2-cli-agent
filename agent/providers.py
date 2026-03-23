@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib import error, request
 
 
@@ -57,24 +57,8 @@ class OpenAIProvider(AgentProvider):
         self.max_api_retries = int(os.environ.get("OPENAI_MAX_API_RETRIES", "3"))
 
     def decide(self, payload: Dict[str, Any]) -> ProviderDecision:
-        state = payload["state"]
         response = self._request_decision_response(payload)
-        parsed = self._parse_response_json(response)
-        args = parsed.get("args")
-        if not isinstance(args, dict):
-            args = {}
-        args = {key: value for key, value in args.items() if value is not None}
-        steps = parsed.get("decision_steps")
-        if not isinstance(steps, list):
-            steps = []
-        steps = [str(item) for item in steps if str(item).strip()]
-        return ProviderDecision(
-            command=_command(parsed["action"], args),
-            rationale=parsed.get("rationale", "OpenAI selected an action."),
-            memory_note=parsed.get("memory_note", ""),
-            decision_steps=steps,
-            provider_name=self.name,
-        )
+        return self._parse_response_decision(response, payload["state"])
 
     def _request_decision_response(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         state = payload["state"]
@@ -108,14 +92,14 @@ class OpenAIProvider(AgentProvider):
                 "store": False,
                 "parallel_tool_calls": False,
                 "text": {"verbosity": "low"},
-                "tools": [self._decision_tool(state)],
-                "tool_choice": {"type": "function", "name": "submit_sts2_action"},
+                "tools": self._decision_tools(state),
+                "tool_choice": "required",
             }
             if current_reasoning_effort:
                 body["reasoning"] = {"effort": current_reasoning_effort}
 
             response = self._responses_create(body)
-            if self._has_function_call(response):
+            if self._has_function_call(response, state):
                 return response
 
             incomplete_reason = ((response.get("incomplete_details") or {}).get("reason"))
@@ -147,37 +131,39 @@ class OpenAIProvider(AgentProvider):
         except error.URLError as exc:
             raise RuntimeError(f"Failed to reach OpenAI API: {exc.reason}") from exc
 
-    def _parse_response_json(self, response: Dict[str, Any]) -> Dict[str, Any]:
+    def _parse_response_decision(self, response: Dict[str, Any], state: Dict[str, Any]) -> ProviderDecision:
         if response.get("error") is not None:
             raise RuntimeError(f"OpenAI API returned error: {response['error']}")
 
-        if not self._has_function_call(response):
+        if not self._has_function_call(response, state):
             incomplete_reason = ((response.get("incomplete_details") or {}).get("reason"))
             status = response.get("status")
             raise RuntimeError(
-                f"OpenAI response did not include submit_sts2_action. "
+                f"OpenAI response did not include a valid action tool call. "
                 f"status={status}, incomplete_reason={incomplete_reason}, response={response}"
             )
 
         for item in response.get("output", []):
             if item.get("type") not in {"function_call", "tool_call"}:
                 continue
-            if item.get("name") != "submit_sts2_action":
+            tool_name = item.get("name")
+            if tool_name not in self._tool_names(state):
                 continue
             arguments = item.get("arguments") or ""
             try:
                 parsed = json.loads(arguments)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"OpenAI tool arguments were not valid JSON: {arguments}") from exc
-            if not isinstance(parsed, dict) or "action" not in parsed:
-                raise RuntimeError(f"OpenAI tool call missing action field: {parsed}")
-            return parsed
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"OpenAI tool call arguments were not an object: {parsed}")
+            return self._normalize_tool_call(tool_name, parsed)
 
-        raise RuntimeError(f"OpenAI response did not include submit_sts2_action: {response}")
+        raise RuntimeError(f"OpenAI response did not include a valid action tool call: {response}")
 
-    def _has_function_call(self, response: Dict[str, Any]) -> bool:
+    def _has_function_call(self, response: Dict[str, Any], state: Dict[str, Any]) -> bool:
+        valid_tools = self._tool_names(state)
         for item in response.get("output", []):
-            if item.get("type") in {"function_call", "tool_call"} and item.get("name") == "submit_sts2_action":
+            if item.get("type") in {"function_call", "tool_call"} and item.get("name") in valid_tools:
                 return True
         return False
 
@@ -185,10 +171,11 @@ class OpenAIProvider(AgentProvider):
         return (
             "You are controlling Slay the Spire 2 through a strict action interface. "
             "Think step by step internally before acting. "
-            "Return exactly one function call named submit_sts2_action. "
-            "The function arguments must contain: the chosen legal action, action args, "
-            "2-5 concise public decision_steps, a short rationale, and a short memory_note. "
-            "Do not invent fields, indices, or unsupported actions."
+            "Return exactly one required function call. "
+            "Each function already encodes one legal API shape for the current state. "
+            "Choose the correct function and fill only its defined fields. "
+            "Always include 2-5 concise public decision_steps, a short rationale, and a short memory_note. "
+            "Do not invent indices, unsupported fields, or unsupported actions."
         )
 
     def _user_prompt(self, payload: Dict[str, Any]) -> str:
@@ -198,6 +185,7 @@ class OpenAIProvider(AgentProvider):
             "attempt": payload.get("attempt", 1),
             "decision": state.get("decision", state.get("type")),
             "allowed_actions": self._allowed_actions(state),
+            "available_tools": self._tool_names(state),
             "action_hints": self._action_hints(state),
             "state": state,
             "memory": payload.get("memory", {}),
@@ -206,47 +194,150 @@ class OpenAIProvider(AgentProvider):
         }
         return json.dumps(prompt, ensure_ascii=False, indent=2)
 
-    def _decision_tool(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    def _tool_names(self, state: Dict[str, Any]) -> List[str]:
+        return [tool["name"] for tool in self._decision_tools(state)]
+
+    def _decision_tools(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        decision = state.get("decision", "")
+        if decision == "map_select":
+            return [
+                self._tool(
+                    "select_map_node_action",
+                    "Select a map node by column and row.",
+                    {
+                        "col": {"type": "integer"},
+                        "row": {"type": "integer"},
+                    },
+                    ["col", "row"],
+                )
+            ]
+        if decision == "combat_play":
+            tools = [
+                self._tool(
+                    "play_card_action",
+                    "Play one card from hand. Use null target_index for non-targeted cards.",
+                    {
+                        "card_index": {"type": "integer"},
+                        "target_index": {"type": ["integer", "null"]},
+                    },
+                    ["card_index", "target_index"],
+                ),
+                self._tool("end_turn_action", "End the current turn.", {}, []),
+            ]
+            if any(pot for pot in state.get("player", {}).get("potions", [])):
+                tools.append(
+                    self._tool(
+                        "use_potion_action",
+                        "Use a potion. Use null target_index for non-targeted potions.",
+                        {
+                            "potion_index": {"type": "integer"},
+                            "target_index": {"type": ["integer", "null"]},
+                        },
+                        ["potion_index", "target_index"],
+                    )
+                )
+            return tools
+        if decision == "card_reward":
+            return [
+                self._tool(
+                    "select_card_reward_action",
+                    "Choose one card from the reward screen.",
+                    {"card_index": {"type": "integer"}},
+                    ["card_index"],
+                ),
+                self._tool("skip_card_reward_action", "Skip the card reward.", {}, []),
+            ]
+        if decision == "bundle_select":
+            return [
+                self._tool(
+                    "select_bundle_action",
+                    "Choose one bundle by bundle_index.",
+                    {"bundle_index": {"type": "integer"}},
+                    ["bundle_index"],
+                )
+            ]
+        if decision == "card_select":
+            tools = []
+            min_select = int(state.get("min_select", 1))
+            max_select = int(state.get("max_select", 1))
+            if min_select == 0:
+                tools.append(self._tool("skip_select_action", "Skip this optional card selection.", {}, []))
+            if max_select == 1:
+                tools.append(
+                    self._tool(
+                        "select_single_card_action",
+                        "Choose exactly one card by card_index.",
+                        {"card_index": {"type": "integer"}},
+                        ["card_index"],
+                    )
+                )
+            else:
+                tools.append(
+                    self._tool(
+                        "select_cards_action",
+                        "Choose one or more cards using a comma-separated indices string like '0,2'.",
+                        {"indices": {"type": "string"}},
+                        ["indices"],
+                    )
+                )
+            return tools
+        if decision == "rest_site":
+            return [
+                self._tool(
+                    "choose_option_action",
+                    "Choose a rest site option by option_index.",
+                    {"option_index": {"type": "integer"}},
+                    ["option_index"],
+                )
+            ]
+        if decision == "event_choice":
+            tools = [
+                self._tool(
+                    "choose_option_action",
+                    "Choose an unlocked event option by option_index.",
+                    {"option_index": {"type": "integer"}},
+                    ["option_index"],
+                )
+            ]
+            tools.append(self._tool("leave_room_action", "Leave the current room.", {}, []))
+            return tools
+        if decision == "shop":
+            return [
+                self._tool(
+                    "buy_card_action",
+                    "Buy a card by card_index.",
+                    {"card_index": {"type": "integer"}},
+                    ["card_index"],
+                ),
+                self._tool(
+                    "buy_relic_action",
+                    "Buy a relic by relic_index.",
+                    {"relic_index": {"type": "integer"}},
+                    ["relic_index"],
+                ),
+                self._tool(
+                    "buy_potion_action",
+                    "Buy a potion by potion_index.",
+                    {"potion_index": {"type": "integer"}},
+                    ["potion_index"],
+                ),
+                self._tool("remove_card_action", "Pay to remove a card from the deck.", {}, []),
+                self._tool("leave_room_action", "Leave the current room.", {}, []),
+            ]
+        return [self._tool("proceed_action", "Proceed after a non-decision or transient error.", {}, [])]
+
+    def _tool(self, name: str, description: str, arg_properties: Dict[str, Any], arg_required: List[str]) -> Dict[str, Any]:
         return {
             "type": "function",
-            "name": "submit_sts2_action",
-            "description": "Submit the next legal STS2 action plus concise public reasoning.",
+            "name": name,
+            "description": description,
             "strict": True,
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["action", "args", "decision_steps", "rationale", "memory_note"],
+                "required": arg_required + ["decision_steps", "rationale", "memory_note"],
                 "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": self._allowed_actions(state),
-                    },
-                    "args": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": [
-                            "col",
-                            "row",
-                            "card_index",
-                            "target_index",
-                            "potion_index",
-                            "bundle_index",
-                            "indices",
-                            "option_index",
-                            "relic_index",
-                        ],
-                        "properties": {
-                            "col": {"type": ["integer", "null"]},
-                            "row": {"type": ["integer", "null"]},
-                            "card_index": {"type": ["integer", "null"]},
-                            "target_index": {"type": ["integer", "null"]},
-                            "potion_index": {"type": ["integer", "null"]},
-                            "bundle_index": {"type": ["integer", "null"]},
-                            "indices": {"type": ["string", "null"]},
-                            "option_index": {"type": ["integer", "null"]},
-                            "relic_index": {"type": ["integer", "null"]},
-                        },
-                    },
+                    **arg_properties,
                     "decision_steps": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -265,6 +356,49 @@ class OpenAIProvider(AgentProvider):
                 },
             },
         }
+
+    def _normalize_tool_call(self, tool_name: str, parsed: Dict[str, Any]) -> ProviderDecision:
+        decision_steps = parsed.get("decision_steps")
+        if not isinstance(decision_steps, list):
+            decision_steps = []
+        decision_steps = [str(item).strip() for item in decision_steps if str(item).strip()]
+        rationale = str(parsed.get("rationale") or "OpenAI selected an action.")
+        memory_note = str(parsed.get("memory_note") or "")
+
+        action_map = {
+            "select_map_node_action": ("select_map_node", ["col", "row"]),
+            "play_card_action": ("play_card", ["card_index", "target_index"]),
+            "end_turn_action": ("end_turn", []),
+            "use_potion_action": ("use_potion", ["potion_index", "target_index"]),
+            "select_card_reward_action": ("select_card_reward", ["card_index"]),
+            "skip_card_reward_action": ("skip_card_reward", []),
+            "select_bundle_action": ("select_bundle", ["bundle_index"]),
+            "select_cards_action": ("select_cards", ["indices"]),
+            "skip_select_action": ("skip_select", []),
+            "select_single_card_action": ("select_cards", ["card_index"]),
+            "choose_option_action": ("choose_option", ["option_index"]),
+            "leave_room_action": ("leave_room", []),
+            "buy_card_action": ("buy_card", ["card_index"]),
+            "buy_relic_action": ("buy_relic", ["relic_index"]),
+            "buy_potion_action": ("buy_potion", ["potion_index"]),
+            "remove_card_action": ("remove_card", []),
+            "proceed_action": ("proceed", []),
+        }
+        if tool_name not in action_map:
+            raise RuntimeError(f"Unknown tool call name: {tool_name}")
+
+        action, keys = action_map[tool_name]
+        args = {key: parsed.get(key) for key in keys if parsed.get(key) is not None}
+        if tool_name == "select_single_card_action":
+            args = {"indices": str(parsed["card_index"])}
+
+        return ProviderDecision(
+            command=_command(action, args),
+            rationale=rationale,
+            memory_note=memory_note,
+            decision_steps=decision_steps,
+            provider_name=self.name,
+        )
 
     def _allowed_actions(self, state: Dict[str, Any]) -> List[str]:
         decision = state.get("decision", "")
