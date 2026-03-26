@@ -34,6 +34,10 @@ python3 agent/run_agent.py \
   - `working_memory.json`：工作记忆，保存最近状态和事实
   - `episodes.jsonl`：逐步 episode 记录
   - `reflections.jsonl`：较高层的反思和异常总结
+- `agent/world_model.py`
+  全局路线规划层。进入 `map_select` 时会读取整张地图，生成当前路线模式、节点偏好和 immediate choice 打分。
+- `agent/combat_log.py`
+  战斗记录器。每场战斗会单独输出一个终端视图日志文件，方便逐场回看。
 - `agent/retrieval.py`
   纯标准库的本地检索层，默认会索引：
   - 根目录 `README.md`
@@ -49,8 +53,10 @@ python3 agent/run_agent.py \
 - command validation，避免 provider 输出非法动作
 - fallback policy，provider 决策无效时回退到安全策略
 - working / episodic / reflective 三层 memory
+- map_select 时的 world-model 路线规划
 - 本地 RAG 检索
 - 每一步落盘日志，便于 replay 和后续分析
+- 每场战斗单独落盘完整终端画面，路径在 `agent/state/combat_logs/`
 
 ## OpenAI Provider
 

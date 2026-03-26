@@ -64,6 +64,7 @@ class OpenAIProvider(AgentProvider):
         state = payload["state"]
         current_max_output_tokens = self.max_output_tokens
         current_reasoning_effort = self.reasoning_effort
+        safe_mode = False
 
         for attempt in range(1, self.max_api_retries + 1):
             body: Dict[str, Any] = {
@@ -74,7 +75,7 @@ class OpenAIProvider(AgentProvider):
                         "content": [
                             {
                                 "type": "input_text",
-                                "text": self._developer_prompt(),
+                                "text": self._developer_prompt(safe_mode=safe_mode),
                             }
                         ],
                     },
@@ -83,7 +84,7 @@ class OpenAIProvider(AgentProvider):
                         "content": [
                             {
                                 "type": "input_text",
-                                "text": self._user_prompt(payload),
+                                "text": self._user_prompt(payload, safe_mode=safe_mode),
                             }
                         ],
                     },
@@ -95,10 +96,17 @@ class OpenAIProvider(AgentProvider):
                 "tools": self._decision_tools(state),
                 "tool_choice": "required",
             }
-            if current_reasoning_effort:
+            if current_reasoning_effort and not safe_mode:
                 body["reasoning"] = {"effort": current_reasoning_effort}
 
-            response = self._responses_create(body)
+            try:
+                response = self._responses_create(body)
+            except RuntimeError as exc:
+                if "invalid_prompt" in str(exc) and not safe_mode:
+                    safe_mode = True
+                    current_reasoning_effort = ""
+                    continue
+                raise
             if self._has_function_call(response, state):
                 return response
 
@@ -167,37 +175,53 @@ class OpenAIProvider(AgentProvider):
                 return True
         return False
 
-    def _developer_prompt(self) -> str:
+    def _developer_prompt(self, safe_mode: bool = False) -> str:
+        if safe_mode:
+            return (
+                "You are controlling Slay the Spire 2 through a strict action interface. "
+                "Return exactly one required function call. "
+                "Each function already encodes one legal API shape for the current state. "
+                "Choose the correct function and fill only its defined fields. "
+                "Include brief public decision notes, a short rationale, and a short memory note. "
+                "Do not invent indices, unsupported fields, or unsupported actions."
+            )
         return (
             "You are controlling Slay the Spire 2 through a strict action interface. "
-            "Think step by step internally before acting. "
             "Return exactly one required function call. "
             "Each function already encodes one legal API shape for the current state. "
-            "Use memory.run_plan, memory.deck_profile, and memory.decision_context as the primary strategic context. "
+            "Use memory.run_plan, memory.deck_profile, memory.decision_context, and world_model as the primary strategic context. "
             "Choose the correct function and fill only its defined fields. "
-            "Always include 2-5 concise public decision_steps, a short rationale, and a short memory_note. "
+            "Always include 2-5 concise public decision notes, a short rationale, and a short memory note. "
             "Do not invent indices, unsupported fields, or unsupported actions."
         )
 
-    def _user_prompt(self, payload: Dict[str, Any]) -> str:
+    def _user_prompt(self, payload: Dict[str, Any], safe_mode: bool = False) -> str:
         state = payload["state"]
-        prompt = {
+        prompt: Dict[str, Any] = {
             "task": "Return the next legal action for the current Slay the Spire 2 state.",
             "attempt": payload.get("attempt", 1),
             "decision": state.get("decision", state.get("type")),
             "allowed_actions": self._allowed_actions(state),
             "available_tools": self._tool_names(state),
-            "strategy_focus": {
+            "action_hints": self._action_hints(state),
+            "state": state,
+            "provider_feedback": payload.get("provider_feedback"),
+        }
+        if safe_mode:
+            prompt["strategy_focus"] = {
+                "run_plan": payload.get("memory", {}).get("run_plan", []),
+                "decision_context": payload.get("memory", {}).get("decision_context", {}),
+            }
+        else:
+            prompt["strategy_focus"] = {
                 "run_plan": payload.get("memory", {}).get("run_plan", []),
                 "deck_profile": payload.get("memory", {}).get("deck_profile", {}),
                 "decision_context": payload.get("memory", {}).get("decision_context", {}),
-            },
-            "action_hints": self._action_hints(state),
-            "state": state,
-            "memory": payload.get("memory", {}),
-            "retrieval": payload.get("retrieval", []),
-            "provider_feedback": payload.get("provider_feedback"),
-        }
+                "world_model": payload.get("world_model", {}),
+            }
+            prompt["memory"] = payload.get("memory", {})
+            prompt["world_model"] = payload.get("world_model", {})
+            prompt["retrieval"] = payload.get("retrieval", [])
         return json.dumps(prompt, ensure_ascii=False, indent=2)
 
     def _tool_names(self, state: Dict[str, Any]) -> List[str]:
@@ -349,7 +373,7 @@ class OpenAIProvider(AgentProvider):
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": 5,
-                        "description": "2-5 concise public reasoning steps, not hidden chain-of-thought.",
+                        "description": "1-5 concise public decision notes.",
                     },
                     "rationale": {
                         "type": "string",

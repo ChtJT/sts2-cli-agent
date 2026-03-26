@@ -30,8 +30,17 @@ public class Node : GodotObject
 {
     public enum InternalMode { Disabled, Front, Back }
 
+    private static readonly List<WeakReference<Node>> _createdNodes = new();
     private Node? _parent;
     private readonly List<Node> _children = new();
+
+    public Node()
+    {
+        lock (_createdNodes)
+        {
+            _createdNodes.Add(new WeakReference<Node>(this));
+        }
+    }
 
     public class MethodName
     {
@@ -56,10 +65,10 @@ public class Node : GodotObject
         return new Godot.Collections.Array<Node>(_children);
     }
 
-    public T? GetNodeOrNull<T>(string path) where T : class => null;
-    public T? GetNodeOrNull<T>(NodePath path) where T : class => null;
-    public T GetNode<T>(string path) where T : class => default!;
-    public T GetNode<T>(NodePath path) where T : class => default!;
+    public T? GetNodeOrNull<T>(string path) where T : class => FindOrCreateStubNode<T>(path);
+    public T? GetNodeOrNull<T>(NodePath path) where T : class => FindOrCreateStubNode<T>(path.ToString());
+    public T GetNode<T>(string path) where T : class => FindOrCreateStubNode<T>(path) ?? default!;
+    public T GetNode<T>(NodePath path) where T : class => FindOrCreateStubNode<T>(path.ToString()) ?? default!;
 
     public virtual void AddChild(Node child, bool forceReadableName = false, InternalMode mode = InternalMode.Disabled)
     {
@@ -100,6 +109,86 @@ public class Node : GodotObject
     public virtual void _Input(InputEvent @event) { }
     public virtual void _UnhandledInput(InputEvent @event) { }
     public virtual void _UnhandledKeyInput(InputEvent @event) { }
+
+    public static Node? FindLastCreated(Type nodeType)
+    {
+        lock (_createdNodes)
+        {
+            for (int i = _createdNodes.Count - 1; i >= 0; i--)
+            {
+                if (!_createdNodes[i].TryGetTarget(out var node))
+                {
+                    _createdNodes.RemoveAt(i);
+                    continue;
+                }
+
+                if (nodeType.IsInstanceOfType(node))
+                    return node;
+            }
+        }
+
+        return null;
+    }
+
+    private T? FindOrCreateStubNode<T>(string? path) where T : class
+    {
+        if (typeof(Node).IsAssignableFrom(typeof(T)))
+        {
+            var segments = (path ?? string.Empty)
+                .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            Node current = this;
+            if (segments.Length == 0)
+                return current as T ?? CreateStubNode<T>();
+
+            foreach (var segment in segments)
+            {
+                var existing = current._children.FirstOrDefault(child => string.Equals(child.Name.ToString(), segment, StringComparison.Ordinal));
+                if (existing == null)
+                {
+                    existing = CreateNamedNode(segment, typeof(T));
+                    current.AddChild(existing);
+                }
+                current = existing;
+            }
+
+            if (current is T typedNode)
+                return typedNode;
+        }
+
+        return CreateStubNode<T>();
+    }
+
+    private static Node CreateNamedNode(string name, Type requestedType)
+    {
+        Node? node = null;
+        if (typeof(Node).IsAssignableFrom(requestedType))
+        {
+            try
+            {
+                node = Activator.CreateInstance(requestedType) as Node;
+            }
+            catch
+            {
+                node = null;
+            }
+        }
+
+        node ??= new Node();
+        node.Name = name;
+        return node;
+    }
+
+    private static T? CreateStubNode<T>() where T : class
+    {
+        try
+        {
+            return Activator.CreateInstance(typeof(T)) as T;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 public class SceneTree : MainLoop
@@ -178,9 +267,94 @@ public static class ProjectSettings
 public static class ResourceLoader
 {
     public enum CacheMode { Reuse, Replace, Ignore }
-    public static T? Load<T>(string path, string? typeHint = null, CacheMode cacheMode = CacheMode.Reuse) where T : class => null;
-    public static bool Exists(string path) => false;
-    public static bool Exists(string path, string typeHint) => false;
+    private static readonly Dictionary<string, Resource> Cache = new();
+
+    public static T? Load<T>(string path, string? typeHint = null, CacheMode cacheMode = CacheMode.Reuse) where T : class
+    {
+        lock (Cache)
+        {
+            if (cacheMode != CacheMode.Replace && Cache.TryGetValue(path, out var cached) && cached is T typedCached)
+                return typedCached;
+
+            var resource = CreateResource(path, typeof(T), typeHint);
+            if (resource == null)
+                return null;
+
+            if (cacheMode != CacheMode.Ignore)
+                Cache[path] = resource;
+            return resource as T;
+        }
+    }
+
+    public static bool Exists(string path) => Exists(path, "");
+
+    public static bool Exists(string path, string typeHint)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+        if (path.StartsWith("res://", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return File.Exists(path) || Directory.Exists(path);
+    }
+
+    private static Resource? CreateResource(string path, Type requestedType, string? typeHint)
+    {
+        Type resourceType = requestedType;
+        if (!typeof(Resource).IsAssignableFrom(resourceType))
+            resourceType = InferResourceType(path, typeHint) ?? typeof(Resource);
+
+        if (resourceType.IsAbstract || !typeof(Resource).IsAssignableFrom(resourceType))
+            resourceType = InferResourceType(path, typeHint) ?? typeof(Resource);
+
+        Resource? resource = null;
+        try
+        {
+            resource = Activator.CreateInstance(resourceType) as Resource;
+        }
+        catch
+        {
+            resource = null;
+        }
+
+        resource ??= InferResourceType(path, typeHint) switch
+        {
+            Type inferred when inferred == typeof(PackedScene) => new PackedScene(),
+            Type inferred when inferred == typeof(Texture2D) => new Texture2D(),
+            Type inferred when inferred == typeof(Shader) => new Shader(),
+            _ => new Resource(),
+        };
+        resource.ResourcePath = path;
+        return resource;
+    }
+
+    private static Type? InferResourceType(string path, string? typeHint)
+    {
+        if (!string.IsNullOrWhiteSpace(typeHint))
+        {
+            if (typeHint.Contains("PackedScene", StringComparison.OrdinalIgnoreCase)) return typeof(PackedScene);
+            if (typeHint.Contains("Texture", StringComparison.OrdinalIgnoreCase)) return typeof(Texture2D);
+            if (typeHint.Contains("Shader", StringComparison.OrdinalIgnoreCase)) return typeof(Shader);
+            if (typeHint.Contains("Material", StringComparison.OrdinalIgnoreCase)) return typeof(Material);
+            if (typeHint.Contains("Image", StringComparison.OrdinalIgnoreCase)) return typeof(Image);
+        }
+
+        var extension = Path.GetExtension(path)?.ToLowerInvariant();
+        return extension switch
+        {
+            ".tscn" => typeof(PackedScene),
+            ".scn" => typeof(PackedScene),
+            ".png" => typeof(Texture2D),
+            ".jpg" => typeof(Texture2D),
+            ".jpeg" => typeof(Texture2D),
+            ".webp" => typeof(Texture2D),
+            ".svg" => typeof(Texture2D),
+            ".gdshader" => typeof(Shader),
+            ".shader" => typeof(Shader),
+            ".tres" => typeof(Resource),
+            ".res" => typeof(Resource),
+            _ => typeof(Resource),
+        };
+    }
 }
 
 public static class Time

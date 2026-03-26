@@ -6,13 +6,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.combat_log import CombatLogRecorder
 from agent.memory import LayeredMemory
 from agent.providers import ProviderDecision, build_provider
 from agent.retrieval import LocalRetriever, RetrievalHit
 from agent.runtime import ROOT, Sts2Process, compact_json
+from agent.world_model import WorldModelPlanner
 
 
 def _utc_stamp() -> str:
@@ -57,6 +58,8 @@ class AgentRunner:
         self.provider = build_provider(config.provider)
         self.retriever = LocalRetriever.from_paths(config.knowledge_paths)
         self.memory = LayeredMemory(config.state_dir)
+        self.world_model = WorldModelPlanner(config.character)
+        self.combat_log = CombatLogRecorder(config.state_dir)
 
     def run(self) -> Dict[str, Any]:
         run_id = _utc_stamp()
@@ -69,6 +72,7 @@ class AgentRunner:
                 "knowledge_paths": self.config.knowledge_paths,
             },
         )
+        self.combat_log.begin_run(run_id)
 
         runtime = Sts2Process(
             game_dir=self.config.game_dir,
@@ -92,28 +96,39 @@ class AgentRunner:
             while step < self.config.max_steps and state is not None:
                 if state.get("type") == "error":
                     self.memory.reflect("engine_error", state.get("message", "unknown error"), {"step": step})
-                    self._print(f"[step={step:03d}] engine error -> proceed: {state.get('message')}")
-                    state = runtime.send({"cmd": "action", "action": "proceed"})
-                    step += 1
-                    continue
+                    self._print(f"[step={step:03d}] engine error -> stop: {state.get('message')}")
+                    self._print_combat_log_path()
+                    return state
 
                 self.memory.observe_state(state)
                 if state.get("decision") == "game_over":
                     summary = "Victory" if state.get("victory") else "Defeat"
                     self.memory.reflect("game_over", summary, state)
                     self._print(f"[step={step:03d}] game_over -> {summary}")
+                    if not state.get("victory"):
+                        self._print_combat_log_path()
                     return state
 
                 retrieval_queries = self._build_queries(state)
                 hits = self.retriever.search_many(retrieval_queries, limit=4)
+                memory_snapshot = self.memory.snapshot().to_dict()
+                if state.get("decision") == "map_select":
+                    map_data = runtime.send({"cmd": "get_map"})
+                    if map_data and map_data.get("type") == "map":
+                        world_model = self.world_model.plan(compact_json(state), map_data, memory_snapshot)
+                        self.memory.update_world_model(world_model)
+                        memory_snapshot = self.memory.snapshot().to_dict()
                 payload = {
                     "state": compact_json(state),
-                    "memory": self.memory.snapshot().to_dict(),
+                    "memory": memory_snapshot,
+                    "world_model": memory_snapshot.get("world_model", {}),
                     "retrieval": [hit.to_dict() for hit in hits],
                 }
 
                 decision, command = self._request_validated_decision(state, payload)
+                self.combat_log.record(step + 1, state, command, decision.decision_steps, decision.rationale)
                 response = runtime.send(command)
+                self.combat_log.finalize(state, response)
                 step += 1
 
                 retrieval_dicts = [hit.to_dict() for hit in hits]
@@ -324,3 +339,8 @@ class AgentRunner:
     def _print(self, message: str) -> None:
         if self.config.verbose:
             print(message)
+
+    def _print_combat_log_path(self) -> None:
+        path = self.combat_log.current_or_last_path()
+        if path is not None:
+            self._print(f"[combat_log] {path}")

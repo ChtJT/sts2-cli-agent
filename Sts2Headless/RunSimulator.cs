@@ -27,6 +27,7 @@ using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.Multiplayer.Serialization;
 using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.Unlocks;
+using Godot;
 
 namespace Sts2Headless;
 
@@ -188,17 +189,20 @@ internal class LocLookup
 /// </summary>
 public class RunSimulator
 {
+    private static readonly string[] HeadlessSceneAssets =
+    {
+        "res://scenes/vfx/ui/vfx_low_hp_border.tscn",
+        "res://scenes/screens/card_selection/choose_a_bundle_selection_screen.tscn",
+    };
+
     private RunState? _runState;
     private static bool _modelDbInitialized;
     private static readonly InlineSynchronizationContext _syncCtx = new();
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
-    private bool _eventOptionChosen;
-    private int _lastEventOptionCount;
-
     // Pending rewards for card selection (populated after combat, before proceeding)
-    private List<Reward>? _pendingRewards;
+    private Queue<CardReward>? _pendingCardRewards;
     private CardReward? _pendingCardReward;
     private bool _rewardsProcessed;
     private int _goldBeforeCombat;
@@ -207,6 +211,7 @@ public class RunSimulator
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
+    private object? _pendingBundleScreenCompletionSource;
 
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null)
     {
@@ -243,6 +248,7 @@ public class RunSimulator
             // Launch the run
             RunManager.Instance.Launch();
             Log("Run launched");
+            WarmHeadlessAssetCache();
 
             // Register event handlers for combat turn transitions
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
@@ -255,6 +261,7 @@ public class RunSimulator
             // Enter first act (generates map)
             RunManager.Instance.EnterAct(0, doTransition: false).GetAwaiter().GetResult();
             Log("Entered Act 0");
+            WarmHeadlessAssetCache();
 
             // Register card selector for cards that need player choice
             CardSelectCmd.UseSelector(_cardSelector);
@@ -333,15 +340,20 @@ public class RunSimulator
 
         // Reset tracking for new room
         _rewardsProcessed = false;
+        _pendingCardRewards = null;
         _pendingCardReward = null;
-        _eventOptionChosen = false;
-        _lastEventOptionCount = 0;
-        _pendingRewards = null;
+        _pendingBundleScreenCompletionSource = null;
         _lastKnownHp = player.Creature?.CurrentHp ?? 0;
 
         var col = Convert.ToInt32(args["col"]);
         var row = Convert.ToInt32(args["row"]);
         var coord = new MapCoord((byte)col, (byte)row);
+        if (!GetAvailableMapChoices().Any(choice =>
+                Convert.ToInt32(choice["col"]) == col &&
+                Convert.ToInt32(choice["row"]) == row))
+        {
+            return Error($"Invalid map choice ({col},{row}) for the current path state");
+        }
 
         Log($"Moving to map coord ({col},{row})");
 
@@ -351,9 +363,23 @@ public class RunSimulator
 
         // Call EnterMapCoord directly (same as what MoveToMapCoordAction does in TestMode)
         // This avoids the action executor which can swallow errors silently.
-        RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
-        _syncCtx.Pump();
-        WaitForActionExecutor();
+        try
+        {
+            RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
+        {
+            Log($"Map select relic session conflict, waiting and retrying: {ex.Message}");
+            WaitForActionExecutor();
+            _syncCtx.Pump();
+            Thread.Sleep(50);
+            _syncCtx.Pump();
+            RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+        }
 
         return DetectDecisionPoint();
     }
@@ -440,12 +466,19 @@ public class RunSimulator
                 Thread.Sleep(100);
                 _syncCtx.Pump();
                 if (!CombatManager.Instance.IsPlayPhase)
-                    return DetectDecisionPoint();
+                {
+                    var stuckState = CombatManager.Instance.DebugOnlyGetState();
+                    return Error(
+                        $"Cannot end turn while combat is not in play phase: round={stuckState?.RoundNumber}, " +
+                        $"player_hp={player.Creature?.CurrentHp ?? 0}, " +
+                        $"is_in_progress={CombatManager.Instance.IsInProgress}");
+                }
             }
         }
 
         // Ensure no actions are still running before ending turn
         WaitForActionExecutor();
+        WarmHeadlessAssetCache();
 
         Log($"Ending turn (round={CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0})");
         _turnStarted.Reset();
@@ -571,7 +604,10 @@ public class RunSimulator
                     if (CombatManager.Instance.IsPlayPhase)
                         Log("Nuclear fallback SUCCEEDED — play phase resumed");
                     else
-                        Log("Nuclear fallback FAILED — returning stuck state");
+                        return Error(
+                            $"EndTurn nuclear fallback failed: round={stuckState?.RoundNumber}, " +
+                            $"player_hp={player.Creature?.CurrentHp ?? 0}, " +
+                            $"enemies=[{string.Join(",", stuckEnemies ?? new())}]");
                 }
                 catch (Exception ex)
                 {
@@ -625,7 +661,8 @@ public class RunSimulator
         catch (Exception ex) { Log($"Add card to deck: {ex.Message}"); }
 
         _pendingCardReward = null;
-        // Check if more rewards pending
+        if (_pendingCardRewards is { Count: > 0 })
+            _pendingCardReward = _pendingCardRewards.Dequeue();
         return DetectDecisionPoint();
     }
 
@@ -645,6 +682,8 @@ public class RunSimulator
             Log("Skipping card reward");
             _pendingCardReward.OnSkipped();
             _pendingCardReward = null;
+            if (_pendingCardRewards is { Count: > 0 })
+                _pendingCardReward = _pendingCardRewards.Dequeue();
         }
         return DetectDecisionPoint();
     }
@@ -696,7 +735,7 @@ public class RunSimulator
         {
             entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought relic: {entry.Model?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
         catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
 
@@ -722,12 +761,11 @@ public class RunSimulator
         {
             entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought potion: {entry.Model?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
         catch (Exception ex)
         {
-            // Potion purchase sometimes NullRefs in headless (missing potion slot UI)
-            Log($"Buy potion failed: {ex.Message}");
+            return Error($"Buy potion failed: {ex.Message}");
         }
 
         return DetectDecisionPoint();
@@ -769,21 +807,43 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoSelectBundle(Player player, Dictionary<string, object?>? args)
     {
-        if (_pendingBundleTcs == null || _pendingBundles == null)
+        if (_pendingBundles == null || (_pendingBundleTcs == null && _pendingBundleScreenCompletionSource == null))
             return Error("No pending bundle selection");
         if (args == null || !args.ContainsKey("bundle_index"))
             return Error("select_bundle requires 'bundle_index'");
 
         var idx = Convert.ToInt32(args["bundle_index"]);
+        if (idx < 0 || idx >= _pendingBundles.Count)
+            return Error($"Invalid bundle index {idx}, {_pendingBundles.Count} bundles available");
         Log($"Bundle selection: pack {idx}");
         var bundles = _pendingBundles;
         var tcs = _pendingBundleTcs;
+        var screenCompletionSource = _pendingBundleScreenCompletionSource;
         _pendingBundles = null;
         _pendingBundleTcs = null;
+        _pendingBundleScreenCompletionSource = null;
 
         // Set result directly (no ContinueWith/ThreadPool)
-        var selected = (idx >= 0 && idx < bundles.Count) ? bundles[idx] : bundles[0];
-        tcs.TrySetResult(selected);
+        var selected = bundles[idx];
+        if (tcs != null)
+        {
+            tcs.TrySetResult(selected);
+        }
+        else if (screenCompletionSource != null)
+        {
+            var trySetResult = screenCompletionSource.GetType().GetMethod(
+                "TrySetResult",
+                BindingFlags.Public | BindingFlags.Instance);
+            if (trySetResult == null)
+                return Error("Bundle screen completion source does not support TrySetResult");
+            var completed = (bool)(trySetResult.Invoke(screenCompletionSource, new object[] { new[] { selected } }) ?? false);
+            if (!completed)
+                return Error("Bundle screen completion source rejected the selected bundle");
+        }
+        else
+        {
+            return Error("No bundle completion source available");
+        }
 
         _syncCtx.Pump();
         WaitForActionExecutor();
@@ -798,13 +858,29 @@ public class RunSimulator
             return Error("select_cards requires 'indices' (comma-separated card indices)");
 
         var indicesStr = args["indices"]?.ToString() ?? "";
-        var indices = indicesStr.Split(',')
-            .Select(s => int.TryParse(s.Trim(), out var v) ? v : -1)
-            .Where(i => i >= 0)
-            .ToArray();
+        var parts = indicesStr.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+            return Error("select_cards requires at least one index");
+
+        var indices = new List<int>();
+        foreach (var part in parts)
+        {
+            if (!int.TryParse(part, out var idx))
+                return Error($"Invalid card index value '{part}'");
+            indices.Add(idx);
+        }
+        if (indices.Count != indices.Distinct().Count())
+            return Error("Duplicate card indices are not allowed");
+        if (indices.Any(i => i < 0 || i >= (_cardSelector.PendingOptions?.Count ?? 0)))
+            return Error("One or more selected card indices are out of range");
+        if (indices.Count < _cardSelector.PendingMinSelect || indices.Count > _cardSelector.PendingMaxSelect)
+        {
+            return Error(
+                $"select_cards requires between {_cardSelector.PendingMinSelect} and {_cardSelector.PendingMaxSelect} cards");
+        }
 
         Log($"Card selection: indices [{string.Join(",", indices)}]");
-        _cardSelector.ResolvePendingByIndices(indices);
+        _cardSelector.ResolvePendingByIndices(indices.ToArray());
         _syncCtx.Pump();
         WaitForActionExecutor();
 
@@ -815,10 +891,6 @@ public class RunSimulator
             Thread.Sleep(200);
             _syncCtx.Pump();
             WaitForActionExecutor();
-            // Force to map after SMITH completes (same pattern as HEAL)
-            Log("Card selection in rest site (SMITH), forcing to map");
-            ForceToMap();
-            return MapSelectState();
         }
 
         return DetectDecisionPoint();
@@ -828,6 +900,8 @@ public class RunSimulator
     {
         if (_cardSelector.HasPending)
         {
+            if (_cardSelector.PendingMinSelect > 0)
+                return Error("Cannot skip a required card selection");
             Log("Skipping card selection");
             _cardSelector.CancelPending();
             _syncCtx.Pump();
@@ -934,6 +1008,11 @@ public class RunSimulator
         if (_runState?.CurrentRoom is RestSiteRoom restSiteRoom)
         {
             Log($"Rest site: choosing option {optionIndex}");
+            var options = restSiteRoom.Options;
+            if (optionIndex < 0 || optionIndex >= options.Count)
+                return Error($"Invalid rest site option index {optionIndex}");
+            if (!options[optionIndex].IsEnabled)
+                return Error($"Rest site option {optionIndex} is disabled");
             try
             {
                 // Run on background thread so Smith card selection can pause
@@ -950,28 +1029,20 @@ public class RunSimulator
                     WaitForActionExecutor();
                     return DetectDecisionPoint();
                 }
-                if (!task.IsCompleted) task.Wait(2000);
+                if (!task.IsCompleted && !task.Wait(2000))
+                    return Error($"Rest site option {optionIndex} did not complete");
                 _syncCtx.Pump();
             }
             catch (Exception ex)
             {
-                Log($"Rest site ChooseLocalOption failed: {ex.Message}");
+                return Error($"Rest site ChooseLocalOption failed: {ex.Message}");
             }
 
-            // After non-Smith rest site options (HEAL, etc.), the options may not clear.
-            // Wait for the action to complete (heal/dig), then force transition to map.
-            if (!_cardSelector.HasPending)
-            {
-                Log("Rest site: option chosen (non-Smith), waiting for action then forcing to map");
-                // Give the action time to complete (heal HP, dig for relic, etc.)
-                WaitForActionExecutor();
-                _syncCtx.Pump();
-                Thread.Sleep(200);
-                _syncCtx.Pump();
-                WaitForActionExecutor();
-                ForceToMap();
-                return MapSelectState();
-            }
+            WaitForActionExecutor();
+            _syncCtx.Pump();
+            Thread.Sleep(200);
+            _syncCtx.Pump();
+            WaitForActionExecutor();
         }
         // For events — use EventSynchronizer
         // Run Chosen() on a background thread so card selections can pause
@@ -982,13 +1053,13 @@ public class RunSimulator
             if (localEvent != null && !localEvent.IsFinished)
             {
                 var options = localEvent.CurrentOptions;
-                var optCountBefore = options?.Count ?? 0;
+                var eventSnapshotBefore = DescribeEventState(localEvent);
                 if (options != null && optionIndex >= 0 && optionIndex < options.Count)
                 {
+                    if (options[optionIndex].IsLocked)
+                        return Error($"Event option {optionIndex} is locked");
                     try
                     {
-                        _eventOptionChosen = true;
-                        _lastEventOptionCount = options.Count;
                         // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
                         var task = Task.Run(() => options[optionIndex].Chosen());
                         for (int i = 0; i < 100; i++)
@@ -1004,18 +1075,51 @@ public class RunSimulator
                             WaitForActionExecutor();
                             return DetectDecisionPoint();
                         }
-                        if (!task.IsCompleted) task.Wait(2000);
+                        if (TryCaptureBundleSelectionScreen())
+                        {
+                            WaitForActionExecutor();
+                            return DetectDecisionPoint();
+                        }
+                        var needsBundleFallback =
+                            !_cardSelector.HasPending &&
+                            !_cardSelector.HasPendingReward &&
+                            _pendingBundles == null &&
+                            (!task.IsCompleted || (!localEvent.IsFinished && DescribeEventState(localEvent) == eventSnapshotBefore));
+                        if (needsBundleFallback)
+                        {
+                            TryHandleBundleSelectionFallback();
+                            for (int i = 0; i < 100; i++)
+                            {
+                                _syncCtx.Pump();
+                                if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
+                                if (_pendingBundles != null) break;
+                                if (task.IsCompleted) break;
+                                Thread.Sleep(5);
+                            }
+                        }
+                        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+                        {
+                            WaitForActionExecutor();
+                            return DetectDecisionPoint();
+                        }
+                        if (TryCaptureBundleSelectionScreen())
+                        {
+                            WaitForActionExecutor();
+                            return DetectDecisionPoint();
+                        }
+                        if (!task.IsCompleted && !task.Wait(2000))
+                            return Error($"Event option {optionIndex} did not complete");
                         _syncCtx.Pump();
                     }
-                    catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
+                    catch (Exception ex) { return Error($"Event choose failed: {ex.Message}"); }
+                }
+                else
+                {
+                    return Error($"Invalid event option index {optionIndex}");
                 }
 
-                var optCountAfter = localEvent.CurrentOptions?.Count ?? 0;
-                if (!localEvent.IsFinished && optCountAfter == optCountBefore && optCountAfter > 0)
-                {
-                    Log($"Event {localEvent.GetType().Name} didn't advance, force-finishing");
-                    ForceToMap();
-                }
+                if (!localEvent.IsFinished && DescribeEventState(localEvent) == eventSnapshotBefore)
+                    return Error($"Event {localEvent.GetType().Name} did not advance after choosing option {optionIndex}");
             }
         }
 
@@ -1026,25 +1130,12 @@ public class RunSimulator
     private Dictionary<string, object?> DoLeaveRoom(Player player)
     {
         Log("Leaving room");
-        try { RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult(); }
-        catch { }
-        _syncCtx.Pump();
-        WaitForActionExecutor();
-
-        // If still in a non-combat room, force to map
-        var room = _runState?.CurrentRoom;
-        if (room is RestSiteRoom || room is MerchantRoom || room is EventRoom || room is TreasureRoom)
-        {
-            Log("Force leaving non-combat room to map");
-            try
-            {
-                RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
-                _syncCtx.Pump();
-                WaitForActionExecutor();
-            }
-            catch (Exception ex) { Log($"Force leave: {ex.Message}"); }
-        }
-        return DetectDecisionPoint();
+        var roomBefore = _runState?.CurrentRoom;
+        if (roomBefore == null)
+            return Error("No room to leave");
+        if (roomBefore is CombatRoom)
+            return Error("leave_room is not valid during combat");
+        return AdvanceFromCurrentRoom(roomBefore, "Leave room");
     }
 
     private Dictionary<string, object?> DoProceed(Player player)
@@ -1063,8 +1154,20 @@ public class RunSimulator
             }
         }
 
-        RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
-        WaitForActionExecutor();
+        var roomBefore = _runState?.CurrentRoom;
+        try
+        {
+            RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+        }
+        catch (Exception ex)
+        {
+            return Error($"Proceed failed: {ex.Message}");
+        }
+
+        if (roomBefore is EventRoom or RestSiteRoom or MerchantRoom or TreasureRoom or CombatRoom)
+            return AdvanceFromCurrentRoom(roomBefore, "Proceed", attemptProceed: false);
         return DetectDecisionPoint();
     }
 
@@ -1078,6 +1181,9 @@ public class RunSimulator
             return Error("No run in progress");
 
         var player = _runState.Players[0];
+        var selectorError = _cardSelector.TakePendingError();
+        if (!string.IsNullOrEmpty(selectorError))
+            return Error(selectorError);
 
         // Check game over (death)
         if (player.Creature != null && player.Creature.IsDead)
@@ -1086,7 +1192,9 @@ public class RunSimulator
         }
 
         // Check if there's a pending bundle selection (Scroll Boxes: pick 1 of N packs)
-        if (_pendingBundles != null && _pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted)
+        if (_pendingBundles != null &&
+            ((_pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted) ||
+             _pendingBundleScreenCompletionSource != null))
         {
             var bundles = _pendingBundles.Select((bundle, i) => new Dictionary<string, object?>
             {
@@ -1183,6 +1291,9 @@ public class RunSimulator
             };
         }
 
+        if (_pendingCardReward == null && _pendingCardRewards is { Count: > 0 })
+            _pendingCardReward = _pendingCardRewards.Dequeue();
+
         // Check if there's a pending card reward
         if (_pendingCardReward != null)
         {
@@ -1192,7 +1303,7 @@ public class RunSimulator
         // Check if RunManager reports game over
         if (RunManager.Instance.IsGameOver)
         {
-            return GameOverState(true);
+            return GameOverState(ResolveVictory(player));
         }
 
         var room = _runState.CurrentRoom;
@@ -1209,6 +1320,7 @@ public class RunSimulator
             // With Task.Yield() patched, combat init should be synchronous
             _syncCtx.Pump();
             WaitForActionExecutor();
+            SpinWaitForCombatStable();
 
             if (CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
             {
@@ -1218,15 +1330,15 @@ public class RunSimulator
             {
                 return DetectPostCombatState(player, combatRoom);
             }
-            // Fallback: brief wait
-            for (int i = 0; i < 20; i++)
-            {
-                _syncCtx.Pump();
-                Thread.Sleep(5);
-                if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
-                if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
-            }
-            return CombatPlayState(player);
+
+            var stuckState = CombatManager.Instance.DebugOnlyGetState();
+            var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
+                .Select(e => $"{e.Monster?.GetType().Name}(hp={e.CurrentHp})")
+                .ToList();
+            return Error(
+                $"Combat stuck before player choice: round={stuckState?.RoundNumber}, " +
+                $"player_hp={player.Creature?.CurrentHp ?? 0}, " +
+                $"enemies=[{string.Join(",", stuckEnemies ?? new())}]");
         }
 
         // Event room
@@ -1266,6 +1378,23 @@ public class RunSimulator
 
     private Dictionary<string, object?> MapSelectState()
     {
+        var choices = GetAvailableMapChoices();
+
+        return new Dictionary<string, object?>
+        {
+            ["type"] = "decision",
+            ["decision"] = "map_select",
+            ["context"] = RunContext(),
+            ["choices"] = choices,
+            ["player"] = PlayerSummary(_runState!.Players[0]),
+            ["act"] = _runState.CurrentActIndex + 1,
+            ["act_name"] = _loc.Act(_runState.Act?.Id.Entry ?? "OVERGROWTH"),
+            ["floor"] = _runState.ActFloor,
+        };
+    }
+
+    private List<Dictionary<string, object?>> GetAvailableMapChoices()
+    {
         var map = _runState?.Map;
         if (map == null)
         {
@@ -1280,85 +1409,38 @@ public class RunSimulator
             {
                 Log($"GenerateMap failed: {ex.Message}");
             }
-            if (map == null)
-                return Error("No map available");
         }
-        var currentCoord = _runState!.CurrentMapCoord;
+        if (map == null)
+            return new();
 
-        List<Dictionary<string, object?>> choices;
+        IEnumerable<MapPoint> candidates;
+        var currentCoord = _runState!.CurrentMapCoord;
         if (currentCoord.HasValue)
         {
             var currentPoint = map.GetPoint(currentCoord.Value);
             if (currentPoint == null)
             {
-                Log($"GetPoint returned null for coord ({currentCoord.Value.col},{currentCoord.Value.row}), falling back to start");
-                // Current coord is invalid (stale after forced room transition); treat as no position
-                choices = new List<Dictionary<string, object?>>();
-                var sp = map.StartingMapPoint;
-                if (sp?.Children != null)
-                {
-                    foreach (var child in sp.Children)
-                    {
-                        choices.Add(new Dictionary<string, object?>
-                        {
-                            ["col"] = (int)child.coord.col,
-                            ["row"] = (int)child.coord.row,
-                            ["type"] = child.PointType.ToString(),
-                        });
-                    }
-                }
+                Log($"GetPoint returned null for coord ({currentCoord.Value.col},{currentCoord.Value.row}), falling back to start children");
+                candidates = map.StartingMapPoint?.Children ?? Enumerable.Empty<MapPoint>();
             }
             else
             {
-                choices = (currentPoint.Children ?? Enumerable.Empty<MapPoint>())
-                    .Select(child => new Dictionary<string, object?>
-                    {
-                        ["col"] = (int)child.coord.col,
-                        ["row"] = (int)child.coord.row,
-                        ["type"] = child.PointType.ToString(),
-                    })
-                    .ToList();
+                candidates = currentPoint.Children ?? Enumerable.Empty<MapPoint>();
             }
         }
         else
         {
-            // Starting point — pick from starting row
-            var startPoint = map.StartingMapPoint;
-            choices = new List<Dictionary<string, object?>>
-            {
-                new()
-                {
-                    ["col"] = (int)startPoint.coord.col,
-                    ["row"] = (int)startPoint.coord.row,
-                    ["type"] = startPoint.PointType.ToString(),
-                }
-            };
-            // Add all children of start point as well since we can travel to them
-            if (startPoint.Children != null)
-            {
-                foreach (var child in startPoint.Children)
-                {
-                    choices.Add(new Dictionary<string, object?>
-                    {
-                        ["col"] = (int)child.coord.col,
-                        ["row"] = (int)child.coord.row,
-                        ["type"] = child.PointType.ToString(),
-                    });
-                }
-            }
+            candidates = map.StartingMapPoint?.Children ?? Enumerable.Empty<MapPoint>();
         }
 
-        return new Dictionary<string, object?>
-        {
-            ["type"] = "decision",
-            ["decision"] = "map_select",
-            ["context"] = RunContext(),
-            ["choices"] = choices,
-            ["player"] = PlayerSummary(_runState!.Players[0]),
-            ["act"] = _runState.CurrentActIndex + 1,
-            ["act_name"] = _loc.Act(_runState.Act?.Id.Entry ?? "OVERGROWTH"),
-            ["floor"] = _runState.ActFloor,
-        };
+        return candidates
+            .Select(child => new Dictionary<string, object?>
+            {
+                ["col"] = (int)child.coord.col,
+                ["row"] = (int)child.coord.row,
+                ["type"] = child.PointType.ToString(),
+            })
+            .ToList();
     }
 
     private Dictionary<string, object?> CombatPlayState(Player player)
@@ -1551,7 +1633,7 @@ public class RunSimulator
         _syncCtx.Pump();
 
         // Generate rewards manually instead of using TestMode auto-accept
-        if (_pendingRewards == null && !_rewardsProcessed)
+        if (_pendingCardRewards == null && !_rewardsProcessed)
         {
             _goldBeforeCombat = player.Gold;
             try
@@ -1568,7 +1650,7 @@ public class RunSimulator
                         || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
                     {
                         try { reward.OnSelectWrapper().GetAwaiter().GetResult(); _syncCtx.Pump(); }
-                        catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
+                        catch (Exception ex) { return Error($"Auto-collect reward failed: {ex.Message}"); }
                     }
                     else if (reward is CardReward cr)
                     {
@@ -1578,19 +1660,23 @@ public class RunSimulator
 
                 if (cardRewards.Count > 0)
                 {
-                    _pendingCardReward = cardRewards[0];
-                    _pendingRewards = rewards;
+                    _pendingCardRewards = new Queue<CardReward>(cardRewards);
+                    _pendingCardReward = _pendingCardRewards.Dequeue();
                     return CardRewardState(player, combatRoom);
                 }
-
-                _pendingRewards = null;
             }
-            catch (Exception ex) { Log($"Generate rewards: {ex.Message}"); }
+            catch (Exception ex) { return Error($"Generate rewards failed: {ex.Message}"); }
+        }
+
+        if (_pendingCardReward == null && _pendingCardRewards is { Count: > 0 })
+        {
+            _pendingCardReward = _pendingCardRewards.Dequeue();
+            return CardRewardState(player, combatRoom);
         }
 
         // No more pending rewards — proceed
         _pendingCardReward = null;
-        _pendingRewards = null;
+        _pendingCardRewards = null;
         _rewardsProcessed = true;
 
         // Boss → next act
@@ -1607,9 +1693,7 @@ public class RunSimulator
             return DetectDecisionPoint();
         }
 
-        // Normal → go to map
-        ForceToMap();
-        return MapSelectState();
+        return AdvanceFromCurrentRoom(combatRoom, "Post-combat");
     }
 
     private Dictionary<string, object?> CardRewardState(Player player, CombatRoom? combatRoom)
@@ -1647,70 +1731,23 @@ public class RunSimulator
         };
     }
 
-    private void ForceToMap()
-    {
-        try
-        {
-            RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-        }
-        catch { }
-
-        if (_runState?.CurrentRoom is not MapRoom)
-        {
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
-            catch (Exception ex) { Log($"ForceToMap: {ex.Message}"); }
-        }
-    }
-
     private Dictionary<string, object?> EventChoiceState(EventRoom eventRoom)
     {
         var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
         _syncCtx.Pump();
 
-        // If we already chose an event option and the event didn't advance, force-finish
-        if (_eventOptionChosen && localEvent != null && !localEvent.IsFinished)
-        {
-            var currentOpts = localEvent.CurrentOptions;
-            var sameOptions = currentOpts != null && currentOpts.Count > 0 &&
-                _lastEventOptionCount > 0 && currentOpts.Count == _lastEventOptionCount;
-            if (sameOptions)
-            {
-                Log($"Event {localEvent.GetType().Name}: same options after choice, force-finishing");
-                _eventOptionChosen = false;
-                ForceToMap();
-                return MapSelectState();
-            }
-            // Options changed — event advanced to next page, show new options
-            _eventOptionChosen = false;
-        }
-
         // If event is finished, proceed to map
         if (localEvent == null || localEvent.IsFinished)
         {
             Log($"Event {localEvent?.GetType().Name ?? "null"} finished, proceeding");
-            try
-            {
-                RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
-                _syncCtx.Pump();
-            }
-            catch { }
-            // Force to map if still in event room
-            if (_runState?.CurrentRoom is EventRoom)
-            {
-                try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
-                catch { }
-            }
-            return _runState?.CurrentRoom is MapRoom ? MapSelectState() : DetectDecisionPoint();
+            return AdvanceFromCurrentRoom(eventRoom, "Event finished");
         }
 
         var currentOptions = localEvent.CurrentOptions;
         if (currentOptions == null || currentOptions.Count == 0)
         {
-            Log($"Event {localEvent.GetType().Name} has no options, auto-skipping");
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
-            catch { }
-            return MapSelectState();
+            Log($"Event {localEvent.GetType().Name} has no options, attempting to proceed");
+            return AdvanceFromCurrentRoom(eventRoom, "Event has no options");
         }
 
         var options = currentOptions
@@ -1841,10 +1878,8 @@ public class RunSimulator
 
         if (options == null || options.Count == 0)
         {
-            // Options empty = choice already made (synchronizer cleared them), go to map
-            Log("Rest site: options empty, proceeding to map");
-            ForceToMap();
-            return MapSelectState();
+            Log("Rest site: options empty, attempting to proceed");
+            return AdvanceFromCurrentRoom(restRoom, "Rest site");
         }
 
         var optionList = options.Select((opt, i) => new Dictionary<string, object?>
@@ -1868,7 +1903,7 @@ public class RunSimulator
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
         var inv = merchantRoom.Inventory;
-        if (inv == null) { ForceToMap(); return MapSelectState(); }
+        if (inv == null) return Error("Merchant room has no inventory");
 
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
             .Select((e, i) => new Dictionary<string, object?>
@@ -1941,12 +1976,11 @@ public class RunSimulator
                 treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
                 _syncCtx.Pump();
             }
-            catch (Exception retryEx) { Log($"Treasure rewards retry failed: {retryEx.Message}"); }
+            catch (Exception retryEx) { return Error($"Treasure rewards retry failed: {retryEx.Message}"); }
         }
-        catch (Exception ex) { Log($"Treasure rewards: {ex.Message}"); }
+        catch (Exception ex) { return Error($"Treasure rewards failed: {ex.Message}"); }
 
-        ForceToMap();
-        return MapSelectState();
+        return AdvanceFromCurrentRoom(treasureRoom, "Treasure room");
     }
 
     private Dictionary<string, object?> GameOverState(bool isVictory)
@@ -1971,6 +2005,274 @@ public class RunSimulator
     #endregion
 
     #region Helpers
+
+    private Dictionary<string, object?> AdvanceFromCurrentRoom(object originalRoom, string context, bool attemptProceed = true)
+    {
+        _syncCtx.Pump();
+        WaitForActionExecutor();
+
+        if (HasRoomAdvanced(originalRoom))
+            return DetectDecisionPoint();
+
+        if (attemptProceed)
+        {
+            try
+            {
+                RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+                _syncCtx.Pump();
+                WaitForActionExecutor();
+            }
+            catch (Exception ex)
+            {
+                return Error($"{context}: proceed failed: {ex.Message}");
+            }
+
+            if (WaitForRoomAdvance(originalRoom, maxIterations: 120, sleepMs: 5))
+                return DetectDecisionPoint();
+
+            try
+            {
+                RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+                _syncCtx.Pump();
+                WaitForActionExecutor();
+            }
+            catch
+            {
+                // Some flows already consumed the terminal proceed but only advance on a
+                // later continuation. Fall through to one more polling window.
+            }
+
+            if (WaitForRoomAdvance(originalRoom, maxIterations: 120, sleepMs: 5))
+                return DetectDecisionPoint();
+        }
+
+        var forced = ForceAdvanceCompletedRoom(originalRoom, context);
+        if (forced != null)
+            return forced;
+
+        return Error($"{context}: room did not advance after completion");
+    }
+
+    private bool WaitForRoomAdvance(object originalRoom, int maxIterations, int sleepMs)
+    {
+        for (int i = 0; i < maxIterations; i++)
+        {
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            if (HasRoomAdvanced(originalRoom))
+                return true;
+            Thread.Sleep(sleepMs);
+        }
+
+        return HasRoomAdvanced(originalRoom);
+    }
+
+    private bool HasRoomAdvanced(object originalRoom)
+    {
+        var currentRoom = _runState?.CurrentRoom;
+        if (currentRoom == null || currentRoom is MapRoom)
+            return true;
+
+        if (!ReferenceEquals(currentRoom, originalRoom))
+        {
+            if (currentRoom.GetType() != originalRoom.GetType())
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool TryCaptureBundleSelectionScreen()
+    {
+        try
+        {
+            if (_pendingBundles != null)
+                return true;
+
+            var asm = typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd).Assembly;
+            var screenType = asm.GetType("MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.NChooseABundleSelectionScreen");
+            if (screenType == null)
+                return false;
+
+            var screen = Node.FindLastCreated(screenType);
+            if (screen == null)
+                return false;
+
+            var bundlesField = screenType.GetField("_bundles", BindingFlags.Instance | BindingFlags.NonPublic);
+            var completionField = screenType.GetField("_completionSource", BindingFlags.Instance | BindingFlags.NonPublic);
+            var bundles = bundlesField?.GetValue(screen) as IReadOnlyList<IReadOnlyList<CardModel>>;
+            var completionSource = completionField?.GetValue(screen);
+            if (bundles == null || completionSource == null)
+                return false;
+
+            var task = completionSource.GetType().GetProperty("Task", BindingFlags.Public | BindingFlags.Instance)?.GetValue(completionSource) as Task;
+            if (task?.IsCompleted == true)
+                return false;
+
+            _pendingBundles = bundles;
+            _pendingBundleScreenCompletionSource = completionSource;
+            Log($"Captured bundle selection screen: {bundles.Count} packs");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log($"Capture bundle selection screen failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private void TryHandleBundleSelectionFallback()
+    {
+        try
+        {
+            var asm = typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd).Assembly;
+            var handlerType = asm.GetType("MegaCrit.Sts2.Core.AutoSlay.Handlers.Screens.ChooseABundleScreenHandler");
+            var rngType = asm.GetType("MegaCrit.Sts2.Core.Random.Rng");
+            if (handlerType == null || rngType == null)
+                return;
+
+            var handler = Activator.CreateInstance(handlerType);
+            if (handler == null)
+                return;
+
+            var rng = rngType.GetProperty("Chaotic", BindingFlags.Public | BindingFlags.Static)?.GetValue(null)
+                      ?? Activator.CreateInstance(rngType, new object[] { 1u, "headless_bundle_fallback" });
+            var handleAsync = handlerType.GetMethod(
+                "HandleAsync",
+                BindingFlags.Public | BindingFlags.Instance,
+                binder: null,
+                types: new[] { rngType, typeof(CancellationToken) },
+                modifiers: null);
+            if (handleAsync == null)
+                return;
+
+            var task = handleAsync.Invoke(handler, new[] { rng, CancellationToken.None }) as Task;
+            if (task == null)
+                return;
+
+            Log("Invoked bundle selection fallback handler");
+
+            for (int i = 0; i < 200; i++)
+            {
+                _syncCtx.Pump();
+                if (task.IsCompleted)
+                    break;
+                Thread.Sleep(5);
+            }
+
+            if (task.IsFaulted)
+                Log($"Bundle fallback handler faulted: {task.Exception}");
+            else if (task.IsCompleted)
+                Log("Bundle selection fallback handler completed");
+        }
+        catch (Exception ex)
+        {
+            Log($"Bundle fallback handler failed: {ex.Message}");
+        }
+    }
+
+    private Dictionary<string, object?>? ForceAdvanceCompletedRoom(object originalRoom, string context)
+    {
+        try
+        {
+            if (_runState == null)
+                return Error($"{context}: run state unavailable during fallback advance");
+
+            if (originalRoom is CombatRoom combatRoom && combatRoom.RoomType == RoomType.Boss)
+            {
+                RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
+            }
+            else if (originalRoom is EventRoom or RestSiteRoom or TreasureRoom or MerchantRoom or CombatRoom)
+            {
+                RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
+            }
+            else
+            {
+                return null;
+            }
+
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            if (WaitForRoomAdvance(originalRoom, maxIterations: 40, sleepMs: 5))
+            {
+                Log($"{context}: forced room advance fallback succeeded");
+                return DetectDecisionPoint();
+            }
+
+            return Error($"{context}: forced room advance fallback did not change room");
+        }
+        catch (Exception ex)
+        {
+            return Error($"{context}: forced room advance fallback failed: {ex.Message}");
+        }
+    }
+
+    private static bool TryGetBooleanMember(object? target, IEnumerable<string> memberNames, out bool value)
+    {
+        value = false;
+        if (target == null) return false;
+
+        foreach (var memberName in memberNames)
+        {
+            var type = target.GetType();
+            var prop = type.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (prop?.PropertyType == typeof(bool))
+            {
+                value = (bool)prop.GetValue(target)!;
+                return true;
+            }
+
+            var field = type.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (field?.FieldType == typeof(bool))
+            {
+                value = (bool)field.GetValue(target)!;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool ResolveVictory(Player player)
+    {
+        if (player.Creature?.IsDead == true || _lastKnownHp <= 0)
+            return false;
+
+        foreach (var target in new object?[] { RunManager.Instance, _runState, _runState?.ExtraFields })
+        {
+            if (TryGetBooleanMember(target, new[] { "IsVictory", "Victory", "HasWon", "WonRun", "DidWin", "PlayerWon" }, out var victory))
+                return victory;
+            if (TryGetBooleanMember(target, new[] { "IsDefeat", "Defeat", "HasLost", "LostRun", "PlayerLost" }, out var defeat))
+                return !defeat;
+        }
+
+        if (_runState?.CurrentRoom is CombatRoom combatRoom && combatRoom.RoomType == RoomType.Boss && combatRoom.IsPreFinished)
+            return true;
+
+        return true;
+    }
+
+    private static string DescribeEventState(dynamic localEvent)
+    {
+        var options = new List<string>();
+        try
+        {
+            foreach (var option in localEvent.CurrentOptions)
+            {
+                options.Add($"{option.TextKey}|{option.IsLocked}|{option.Title?.LocEntryKey}|{option.Description?.LocEntryKey}");
+            }
+        }
+        catch
+        {
+            options.Add("options_unavailable");
+        }
+
+        string descriptionKey;
+        try { descriptionKey = localEvent.Description?.LocEntryKey ?? ""; }
+        catch { descriptionKey = ""; }
+
+        return $"{localEvent.GetType().Name}|{descriptionKey}|{string.Join("||", options)}";
+    }
 
     private void WaitForActionExecutor()
     {
@@ -2182,6 +2484,15 @@ public class RunSimulator
         // because there's no Godot scene tree, causing the ActionExecutor to deadlock.
         PatchCmdWait();
 
+        // Patch low-HP/player hurt vignette helpers to no-op in headless mode.
+        // These VFX nodes require Godot scene assets that do not exist in CLI-only runs.
+        PatchHeadlessUiVfx();
+
+        // .NET 11 cannot use the existing Harmony/MonoMod patches in this repo reliably.
+        // Seed known UI-only scenes into the game's asset cache so missing VFX / bundle
+        // screens do not crash enemy turns or event flows when patching is unavailable.
+        WarmHeadlessAssetCache();
+
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
 
@@ -2301,6 +2612,106 @@ public class RunSimulator
         }
     }
 
+    private static void PatchHeadlessUiVfx()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.headlessuivfx");
+            var asm = typeof(MegaCrit.Sts2.Core.Commands.CardPileCmd).Assembly;
+            var type = asm.GetType("MegaCrit.Sts2.Core.Nodes.Vfx.PlayerHurtVignetteHelper");
+            if (type == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find PlayerHurtVignetteHelper type");
+                return;
+            }
+
+            var methods = type.GetMethods(System.Reflection.BindingFlags.Public |
+                                          System.Reflection.BindingFlags.NonPublic |
+                                          System.Reflection.BindingFlags.Static |
+                                          System.Reflection.BindingFlags.Instance)
+                .Where(m => m.Name == "Play")
+                .ToList();
+
+            if (methods.Count == 0)
+            {
+                Console.Error.WriteLine("[WARN] Could not find PlayerHurtVignetteHelper.Play to patch");
+                return;
+            }
+
+            var voidPrefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.VoidNoOpPrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            var taskPrefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.CompletedTaskPrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+
+            foreach (var method in methods)
+            {
+                if (method.ReturnType == typeof(void) && voidPrefix != null)
+                {
+                    harmony.Patch(method, new HarmonyMethod(voidPrefix));
+                    Console.Error.WriteLine($"[INFO] Patched {type.FullName}.{method.Name}() to no-op");
+                }
+                else if (method.ReturnType == typeof(Task) && taskPrefix != null)
+                {
+                    harmony.Patch(method, new HarmonyMethod(taskPrefix));
+                    Console.Error.WriteLine($"[INFO] Patched {type.FullName}.{method.Name}() to completed task");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch headless UI VFX: {ex.Message}");
+        }
+    }
+
+    private static void WarmHeadlessAssetCache()
+    {
+        try
+        {
+            var asm = typeof(MegaCrit.Sts2.Core.Commands.CardPileCmd).Assembly;
+            var preloadManagerType = asm.GetType("MegaCrit.Sts2.Core.Assets.PreloadManager");
+            if (preloadManagerType == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find PreloadManager type for headless asset warmup");
+                return;
+            }
+
+            var cacheProperty = preloadManagerType.GetProperty(
+                "Cache",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            var cache = cacheProperty?.GetValue(null);
+            if (cache == null)
+            {
+                Console.Error.WriteLine("[INFO] Headless asset warmup skipped: PreloadManager.Cache is null");
+                return;
+            }
+
+            var setAsset = cache.GetType().GetMethod(
+                "SetAsset",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null,
+                types: new[] { typeof(string), typeof(Resource) },
+                modifiers: null);
+            if (setAsset == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find AssetCache.SetAsset for headless asset warmup");
+                return;
+            }
+
+            int warmed = 0;
+            foreach (var path in HeadlessSceneAssets)
+            {
+                setAsset.Invoke(cache, new object[] { path, new PackedScene { ResourcePath = path } });
+                warmed++;
+            }
+
+            Console.Error.WriteLine($"[INFO] Warmed headless AssetCache entries: {warmed}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to warm headless AssetCache: {ex.Message}");
+        }
+    }
+
     private static void PatchTaskYield()
     {
         try
@@ -2404,6 +2815,7 @@ public class RunSimulator
         public List<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult>? PendingRewardCards { get; private set; }
         private ManualResetEventSlim? _rewardWait;
         private int _rewardChoice = -1;
+        private string? _pendingError;
 
         public CardModel? GetSelectedCardReward(
             IReadOnlyList<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult> options,
@@ -2417,11 +2829,17 @@ public class RunSimulator
             _rewardWait = new ManualResetEventSlim(false);
 
             Console.Error.WriteLine($"[SIM] Card reward pending: {options.Count} cards (blocking)");
-            _rewardWait.Wait(TimeSpan.FromSeconds(300)); // Wait up to 5 min
+            var signaled = _rewardWait.Wait(TimeSpan.FromSeconds(300)); // Wait up to 5 min
 
             var choice = _rewardChoice;
             PendingRewardCards = null;
             _rewardWait = null;
+
+            if (!signaled)
+            {
+                _pendingError = "Timed out waiting for card reward selection";
+                return null;
+            }
 
             if (choice >= 0 && choice < options.Count)
                 return options[choice].Card;
@@ -2440,6 +2858,13 @@ public class RunSimulator
         {
             _rewardChoice = -1;
             _rewardWait?.Set();
+        }
+
+        public string? TakePendingError()
+        {
+            var error = _pendingError;
+            _pendingError = null;
+            return error;
         }
     }
 
@@ -2463,6 +2888,17 @@ public class RunSimulator
         {
             __result = Task.CompletedTask;
             return false; // Skip original method
+        }
+
+        public static bool VoidNoOpPrefix()
+        {
+            return false;
+        }
+
+        public static bool CompletedTaskPrefix(ref Task __result)
+        {
+            __result = Task.CompletedTask;
+            return false;
         }
     }
 

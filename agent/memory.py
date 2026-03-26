@@ -563,6 +563,7 @@ class MemorySnapshot:
     deck_profile: Dict[str, Any]
     run_plan: List[str]
     decision_context: Dict[str, Any]
+    world_model: Dict[str, Any]
     recent_events: List[Dict[str, Any]]
     recent_reflections: List[Dict[str, Any]]
 
@@ -573,6 +574,7 @@ class MemorySnapshot:
             "deck_profile": self.deck_profile,
             "run_plan": self.run_plan,
             "decision_context": self.decision_context,
+            "world_model": self.world_model,
             "recent_events": self.recent_events,
             "recent_reflections": self.recent_reflections,
         }
@@ -599,6 +601,7 @@ class LayeredMemory:
             "deck_profile": {},
             "run_plan": [],
             "decision_context": {},
+            "world_model": {},
             "current_run": {},
             "recent_events": [],
             "recent_reflections": [],
@@ -619,6 +622,7 @@ class LayeredMemory:
         self.working["deck_profile"] = {}
         self.working["run_plan"] = []
         self.working["decision_context"] = {}
+        self.working["world_model"] = {}
         self.working["recent_events"] = []
         self.working["recent_reflections"] = []
         self.working["last_updated"] = _utc_now()
@@ -631,6 +635,7 @@ class LayeredMemory:
             deck_profile=self.working.get("deck_profile", {}),
             run_plan=self.working.get("run_plan", [])[-4:],
             decision_context=self.working.get("decision_context", {}),
+            world_model=self.working.get("world_model", {}),
             recent_events=self.working.get("recent_events", [])[-limit:],
             recent_reflections=self.working.get("recent_reflections", [])[-3:],
         )
@@ -665,6 +670,11 @@ class LayeredMemory:
         self.working["deck_profile"] = deck_profile
         self.working["run_plan"] = _build_run_plan(state, facts, deck_profile)
         self.working["decision_context"] = _decision_context(state, facts, deck_profile)
+        self.working["last_updated"] = _utc_now()
+        _safe_write_json(self.working_path, self.working)
+
+    def update_world_model(self, world_model: Dict[str, Any]) -> None:
+        self.working["world_model"] = world_model
         self.working["last_updated"] = _utc_now()
         _safe_write_json(self.working_path, self.working)
 
